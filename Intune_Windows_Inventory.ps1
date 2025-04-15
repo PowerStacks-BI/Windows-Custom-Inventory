@@ -48,10 +48,10 @@ Version: 5.0
 [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
 
 # Replace with your Log Analytics Workspace ID
-$CustomerId = ""  
+$CustomerId = "005d3d97-e21b-46fa-8e35-871b30f1112a"  
 
 # Replace with your Primary Key
-$SharedKey = ""
+$SharedKey = "99WwZQX89DKVoDHpakV+pupfZAzQCy7gsZLep7uU6DMDECUeS4ReqsHW7BIZtUG7E/ihWdqrtWNg3xN1oQb4MQ=="
 
 
 #Control if you want to collect Device, App, and Driver Inventory or both (True = Collect)
@@ -64,8 +64,9 @@ $CollectMicrosoft365 = $true
 $CollectWarranty = $true
 
 #Warranty key
-$WarrantyDellClientID = $null
-$WarrantyDellClientSecret = $null
+#Warranty keys
+$WarrantyDellClientID = "l74bde028c7409499db86e07db0c9353bb"
+$WarrantyDellClientSecret = "1ca8193a83f8435cb950640e818b4c6b"
 $WarrantyLenovoClientID = $null
 
 # You can use an optional field to specify the timestamp from the data. If the time field is not specified, Azure Monitor assumes the time is the message ingestion time
@@ -128,12 +129,14 @@ function Get-Microsoft365() {
         try {
             $OfficeVersion = [version](Get-ItemProperty -Path 'HKLM:\SOFTWARE\Microsoft\Office\ClickToRun\Configuration' -ErrorAction Stop | Select-Object -ExpandProperty VersionToReport)
             $OfficeProductIds = (Get-ItemProperty -Path 'HKLM:\SOFTWARE\Microsoft\Office\ClickToRun\Configuration' -ErrorAction Stop | Select-Object -ExpandProperty ProductReleaseIds)
-        } catch {
+        }
+        catch {
             Write-Output "Failed to retrieve Office version or product IDs: $_"
             $OfficeVersion = $null
             $OfficeProductIds = $null
         }
-    } else {
+    }
+    else {
         #Write-Output "No Click-to-Run Office detected. Setting default values."
         $OfficeVersion = $null
         $OfficeProductIds = $null
@@ -165,7 +168,8 @@ function Get-Microsoft365() {
             foreach ($Channel in $Channels) {
                 if ($OfficeUpdateChannelGPO -eq $Channel.GPO) { $OfficeChannel = $Channel }
             }
-        } else {
+        }
+        else {
             $C2RConfigurationPath = 'HKLM:\SOFTWARE\Microsoft\Office\ClickToRun\Configuration'
             Write-Output 'Office is not configured to use a GPO update channel.'
             $OfficeUpdateURL = [System.Uri](Get-ItemProperty -Path $C2RConfigurationPath -ErrorAction 'SilentlyContinue' | Select-Object -ExpandProperty UpdateURL -ErrorAction 'SilentlyContinue')
@@ -195,7 +199,8 @@ function Get-Microsoft365() {
                     $UpdateAPIURL = "https://clients.config.office.net/releases/v1.0/LatestRelease/$ChannelURLPathPart`?ReleaseType="
                     $ReleaseInfo = Invoke-RestMethod -Uri $UpdateAPIURL -Method 'GET' -ErrorAction 'Stop'
                 }
-            } catch {
+            }
+            catch {
                 Write-Output "Unable to get latest update info: $_"
                 $ReleaseInfo = [PSCustomObject]@{
                     releaseType      = $null
@@ -205,7 +210,8 @@ function Get-Microsoft365() {
                     releaseVersion   = $null
                 }
             }
-        } elseif ($OfficeProductIds -like '*2019Volume*') {
+        }
+        elseif ($OfficeProductIds -like '*2019Volume*') {
             try {
                 $UpdateAPIURL = 'https://clients.config.office.net/releases/v1.0/LatestRelease/LTSB?ReleaseType=security'
                 $ReleaseInfo = Invoke-RestMethod -Uri $UpdateAPIURL -Method 'GET' -ErrorAction 'Stop'
@@ -213,7 +219,8 @@ function Get-Microsoft365() {
                     $UpdateAPIURL = 'https://clients.config.office.net/releases/v1.0/LatestRelease/LTSB?ReleaseType='
                     $ReleaseInfo = Invoke-RestMethod -Uri $UpdateAPIURL -Method 'GET' -ErrorAction 'Stop'
                 }
-            } catch {
+            }
+            catch {
                 Write-Output "Unable to get latest update info: $_"
                 $ReleaseInfo = [PSCustomObject]@{
                     releaseType      = $null
@@ -223,7 +230,8 @@ function Get-Microsoft365() {
                     releaseVersion   = $null
                 }
             }
-        } elseif ($OfficeProductIds -like '*2021Volume*') {
+        }
+        elseif ($OfficeProductIds -like '*2021Volume*') {
             try {
                 $UpdateAPIURL = 'https://clients.config.office.net/releases/v1.0/LatestRelease/LTSB2021?ReleaseType=security'
                 $ReleaseInfo = Invoke-RestMethod -Uri $UpdateAPIURL -Method 'GET' -ErrorAction 'Stop'
@@ -231,7 +239,8 @@ function Get-Microsoft365() {
                     $UpdateAPIURL = 'https://clients.config.office.net/releases/v1.0/LatestRelease/LTSB2021?ReleaseType='
                     $ReleaseInfo = Invoke-RestMethod -Uri $UpdateAPIURL -Method 'GET' -ErrorAction 'Stop'
                 }
-            } catch {
+            }
+            catch {
                 Write-Output "Unable to get latest update info: $_"
                 $ReleaseInfo = [PSCustomObject]@{
                     releaseType      = $null
@@ -241,7 +250,8 @@ function Get-Microsoft365() {
                     releaseVersion   = $null
                 }
             }
-        } else {
+        }
+        else {
             Write-Output "Non-M365/Volume Office detected. Setting default release info."
             $ReleaseInfo = [PSCustomObject]@{
                 releaseType      = $null
@@ -251,7 +261,8 @@ function Get-Microsoft365() {
                 releaseVersion   = $null
             }
         }
-    } else {
+    }
+    else {
         $ReleaseInfo = [PSCustomObject]@{
             releaseType      = $null
             buildVersion     = $null
@@ -275,45 +286,52 @@ function Get-Microsoft365() {
     if ($IsC2R) {  
 
         ### Preprocess data
-            $InstalledVersion = if ($OfficeVersion) { 
+        $InstalledVersion = if ($OfficeVersion) { 
             $OfficeVersion.ToString() 
-        } else { 
+        }
+        else { 
             $null
         }
 
         $UpdateChannel = if ($OfficeChannel.Name) { 
             $OfficeChannel.Name
-        } else { 
+        }
+        else { 
             $null
         }
 
         $LatestReleaseType = if ($ReleaseType) { 
             $ReleaseType.ToString() 
-        } else { 
+        }
+        else { 
             $null
         }
 
         $LatestReleaseVersion = if ($TargetVersion) { 
             $TargetVersion.ToString() 
-        } else { 
+        }
+        else { 
             $null
         }
 
         $EndOfSupportDate = if ($null -ne $ReleaseInfo.endOfSupportDate -and $ReleaseInfo.endOfSupportDate -ne '0001-01-01T00:00:00Z') { 
             $ReleaseInfo.endOfSupportDate.ToString() 
-        } else { 
+        }
+        else { 
             $null 
         }
 
         $ReleaseDate = if ($ReleaseInfo -and $ReleaseInfo.availabilityDate -and $ReleaseInfo.availabilityDate -ne '0001-01-01T00:00:00Z') { 
             $ReleaseInfo.availabilityDate.ToString() 
-        } else { 
+        }
+        else { 
             $null 
         }
 
         $ReleaseID = if ($ReleaseInfo -and $ReleaseInfo.releaseVersion) { 
             $ReleaseInfo.releaseVersion.ToString()
-        } else { 
+        }
+        else { 
             $null 
         }
 
@@ -327,7 +345,8 @@ function Get-Microsoft365() {
             'ReleaseDate'          = $ReleaseDate
             'ReleaseID'            = $ReleaseID
         }
-    } else {
+    }
+    else {
         $OfficeVersionData = $null
     }
 
@@ -335,117 +354,141 @@ function Get-Microsoft365() {
 }
 
 # Function to get Installed Drivers
+<#
+Feel free to edit the query user to collect drivers.
+#>
 function Get-InstalledDrivers() {
     # Get PnP signed drivers
     $PNPSigned_Drivers = Get-CimInstance -ClassName Win32_PnPSignedDriver | Where-Object {
         ($_.Manufacturer -ne "Microsoft") -and 
         ($_.DriverProviderName -ne "Microsoft") -and 
         ($_.DeviceName -ne $null)
-    } | Select-Object DeviceName,DriverVersion,DriverDate,DeviceClass,DeviceID,HardwareID,Manufacturer,InfName,Location,Description,DriverProviderName
+    } | Select-Object DeviceName, DriverVersion, DriverDate, DeviceClass, DeviceID, HardwareID, Manufacturer, InfName, Location, Description, DriverProviderName
+    $PNPSigned_Drivers
 
     # Get installed MSU packages
     $InstalledDrivers = Get-Package -ProviderName msu | Where-Object {
         $_.Metadata.Item("SupportUrl") -match "target=hub"
     }
+    $InstalledDrivers
 
     # Get optional updates
     $updateSession = New-Object -ComObject Microsoft.Update.Session
     $updateSearcher = $updateSession.CreateUpdateSearcher()
     $searchResult = $updateSearcher.Search("IsInstalled=0 AND Type='Driver'")
     $OptionalWUList = @()
-    If($searchResult.Updates.Count -gt 0) {
-        For($i = 0; $i -lt $searchResult.Updates.Count; $i++) {
+    $searchResult.Updates.Count
+    If ($searchResult.Updates.Count -gt 0) {
+        For ($i = 0; $i -lt $searchResult.Updates.Count; $i++) {
             $update = $searchResult.Updates.Item($i)
             $OptionalWUList += [PSCustomObject]@{
-                WUName                 = $update.Title
-                DriverName             = $update.DriverModel
-                DriverVersion          = $null
-                DriverReleaseDate      = $update.DriverVerDate.ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ss.fffffffZ")
-                DriverClass            = $update.DriverClass.ToUpper()
-                DriverID               = $null
-                DriverHardwareID       = $update.DriverHardwareID
-                DriverManufacturer     = $update.DriverManufacturer
-                DriverInfName          = $null
-                DriverLocation         = $null
-                DriverDescription      = $update.Description
-                DriverProvider         = $update.DriverProvider
-                DriverPublishedOn      = $update.LastDeploymentChangeTime.ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ss.fffffffZ")
-                DriverStatus           = "Optional"
+                WUName             = $update.Title
+                DriverName         = $update.DriverModel
+                DriverVersion      = $null
+                DriverReleaseDate  = $update.DriverVerDate.ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ss.fffffffZ")
+                DriverClass        = $update.DriverClass.ToUpper()
+                DriverID           = $null
+                DriverHardwareID   = $update.DriverHardwareID
+                DriverManufacturer = $update.DriverManufacturer
+                DriverInfName      = $null
+                DriverLocation     = $null
+                DriverDescription  = $update.Description
+                DriverProvider     = $update.DriverProvider
+                DriverPublishedOn  = $update.LastDeploymentChangeTime.ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ss.fffffffZ")
+                DriverStatus       = "Optional"
             }
         }
     }
 
     # Link installed drivers
     $LinkedDrivers = foreach ($installedDriver in $InstalledDrivers) {
+        Write-Host "Attempting to link driver: $installedDriver"
         $versionFromName = $installedDriver.Name.Split()[-1]
+        Write-Host "Driver version from name: $versionFromName"
         $matchingDriver = $PNPSigned_Drivers | Where-Object {
             $_.DriverVersion -eq $versionFromName
         } | Select-Object -First 1
 
         if ($matchingDriver) {
             [PSCustomObject]@{
-                WUName                 = $installedDriver.Name
-                DriverName             = $matchingDriver.DeviceName
-                DriverVersion          = $matchingDriver.DriverVersion
-                DriverReleaseDate      = $matchingDriver.DriverDate.ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ss.fffffffZ")
-                DriverClass            = $matchingDriver.DeviceClass
-                DriverID               = $matchingDriver.DeviceID
-                DriverHardwareID       = $matchingDriver.HardwareID
-                DriverManufacturer     = $matchingDriver.Manufacturer
-                DriverInfName          = $matchingDriver.InfName
-                DriverLocation         = $matchingDriver.Location
-                DriverDescription      = $matchingDriver.Description
-                DriverProvider         = $matchingDriver.DriverProviderName
-                DriverPublishedOn      = $null
-                DriverStatus           = "Installed"
+                WUName             = $installedDriver.Name
+                DriverName         = $matchingDriver.DeviceName
+                DriverVersion      = $matchingDriver.DriverVersion
+                DriverReleaseDate  = $matchingDriver.DriverDate.ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ss.fffffffZ")
+                DriverClass        = $matchingDriver.DeviceClass
+                DriverID           = $matchingDriver.DeviceID
+                DriverHardwareID   = $matchingDriver.HardwareID
+                DriverManufacturer = $matchingDriver.Manufacturer
+                DriverInfName      = $matchingDriver.InfName
+                DriverLocation     = $matchingDriver.Location
+                DriverDescription  = $matchingDriver.Description
+                DriverProvider     = $matchingDriver.DriverProviderName
+                DriverPublishedOn  = $null
+                DriverStatus       = "Installed"
             }
         }
     }
 
     # Add unmatched installed drivers
     $matchedVersions = $LinkedDrivers | Where-Object { $_.DriverVersion } | Select-Object -ExpandProperty DriverVersion
+    $matchedVersions
+    start-sleep 10
     $unmatchedDrivers = $PNPSigned_Drivers | Where-Object { $matchedVersions -notcontains $_.DriverVersion }
+    $unmatchedDrivers
 
     # Combine both sets of drivers using the same foreach pattern
     $LinkedDrivers = @(
+        $LinkedDrivers
         $LinkedDrivers  # Include existing linked drivers
         foreach ($driver in $unmatchedDrivers) {
+
+            $driver.DeviceName
+            $driver.DriverVersion
+            # $driver.DriverDate.ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ss.fffffffZ")
+            $driver.DeviceClass 
             [PSCustomObject]@{
-                WUName                 = $null
-                DriverName             = $driver.DeviceName
-                DriverVersion          = $driver.DriverVersion
-                DriverReleaseDate      = $driver.DriverDate.ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ss.fffffffZ")
-                DriverClass            = $driver.DeviceClass
-                DriverID               = $driver.DeviceID
-                DriverHardwareID       = $driver.HardwareID
-                DriverManufacturer     = $driver.Manufacturer
-                DriverInfName          = $driver.InfName
-                DriverLocation         = $driver.Location
-                DriverDescription      = $driver.Description
-                DriverProvider         = $driver.DriverProviderName
-                DriverPublishedOn      = $null
-                DriverStatus           = "Installed"
+                WUName             = $null
+                DriverName         = $driver.DeviceName
+                DriverVersion      = $driver.DriverVersion
+                DriverReleaseDate  = if ($driver.DriverDate) { 
+                    $driver.DriverDate.ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ss.fffffffZ") 
+                }
+                else { 
+                    $null 
+                }
+                DriverClass        = $driver.DeviceClass
+                DriverID           = $driver.DeviceID
+                DriverHardwareID   = $driver.HardwareID
+                DriverManufacturer = $driver.Manufacturer
+                DriverInfName      = $driver.InfName
+                DriverLocation     = $driver.Location
+                DriverDescription  = $driver.Description
+                DriverProvider     = $driver.DriverProviderName
+                DriverPublishedOn  = $null
+                DriverStatus       = "Installed"
             }
+
         }
     )
+
 
     # Add optional updates to the list
     foreach ($optionalDriver in $OptionalWUList) {
         $LinkedDrivers += [PSCustomObject]@{
-            WUName                 = $optionalDriver.WUName
-            DriverName             = $optionalDriver.DriverName
-            DriverVersion          = $optionalDriver.DriverVersion
-            DriverReleaseDate      = $optionalDriver.DriverDate
-            DriverClass            = $optionalDriver.DeviceClass
-            DriverID               = $optionalDriver.DeviceID
-            DriverHardwareID       = $optionalDriver.DriverHardwareID
-            DriverManufacturer     = $optionalDriver.Manufacturer
-            DriverInfName          = $optionalDriver.InfName
-            DriverLocation         = $optionalDriver.Location
-            DriverDescription      = $optionalDriver.Description
-            DriverProvider         = $optionalDriver.DriverProvider
-            DriverPublishedOn      = $optionalDriver.DriverChangeTime
-            DriverStatus           = $optionalDriver.DriverStatus
+            WUName             = $optionalDriver.WUName
+            DriverName         = $optionalDriver.DriverName
+            DriverVersion      = $optionalDriver.DriverVersion
+            DriverReleaseDate  = $optionalDriver.DriverDate
+            DriverClass        = $optionalDriver.DeviceClass
+            DriverID           = $optionalDriver.DeviceID
+            DriverHardwareID   = $optionalDriver.DriverHardwareID
+            DriverManufacturer = $optionalDriver.Manufacturer
+            DriverInfName      = $optionalDriver.InfName
+            DriverLocation     = $optionalDriver.Location
+            DriverDescription  = $optionalDriver.Description
+            DriverProvider     = $optionalDriver.DriverProvider
+            DriverPublishedOn  = $optionalDriver.DriverChangeTime
+            DriverStatus       = $optionalDriver.DriverStatus
         }
     }
 
@@ -472,22 +515,22 @@ function Get-DellWarranty([Parameter(Mandatory = $true)]$SourceDevice) {
     $WarReq = Invoke-RestMethod -Uri "https://apigtwb2c.us.dell.com/PROD/sbil/eapi/v5/asset-entitlements" -Headers $headersReq -Body $ReqBody -Method Get -ContentType "application/json"
     if ($warreq.entitlements.serviceleveldescription) {
         $WarObj = [PSCustomObject]@{
-            'ServiceProvider'               = 'Dell'
-            'ServiceModel'                  = $warreq.productLineDescription
-            'ServiceTag'                    = $SourceDevice
-            'ServiceLevelDescription'       = $warreq.entitlements.serviceleveldescription -join "`n"
-            'WarrantyStartDate'             = ($warreq.entitlements.startdate | sort-object -Descending | select-object -last 1)
-            'WarrantyEndDate'               = ($warreq.entitlements.enddate | sort-object | select-object -last 1)
+            'ServiceProvider'         = 'Dell'
+            'ServiceModel'            = $warreq.productLineDescription
+            'ServiceTag'              = $SourceDevice
+            'ServiceLevelDescription' = $warreq.entitlements.serviceleveldescription -join "`n"
+            'WarrantyStartDate'       = ($warreq.entitlements.startdate | sort-object -Descending | select-object -last 1)
+            'WarrantyEndDate'         = ($warreq.entitlements.enddate | sort-object | select-object -last 1)
         }
     }
     else {
         $WarObj = [PSCustomObject]@{
-            'ServiceProvider'               = 'Dell'
-            'ServiceModel'                  = $null
-            'ServiceTag'                    = $SourceDevice
-            'ServiceLevelDescription'       = 'Could not get warranty information'
-            'WarrantyStartDate'             = $null
-            'WarrantyEndDate'               = $null
+            'ServiceProvider'         = 'Dell'
+            'ServiceModel'            = $null
+            'ServiceTag'              = $SourceDevice
+            'ServiceLevelDescription' = 'Could not get warranty information'
+            'WarrantyStartDate'       = $null
+            'WarrantyEndDate'         = $null
         }
     }
     return $WarObj
@@ -498,25 +541,26 @@ function Get-LenovoWarranty([Parameter(Mandatory = $true)]$SourceDevice) {
     $headersReq = @{ "ClientID" = $WarrantyLenovoClientID }
     $WarReq = Invoke-RestMethod -Uri "http://supportapi.lenovo.com/V2.5/Warranty?Serial=$SourceDevice" -Headers $headersReq -Method Get -ContentType "application/json"
     
-    try{
-        $Warlist = $WarReq.Warranty | Where-Object {($_.ID -eq "36Y") -or ($_.ID -eq "3EZ") -or ($_.ID -eq "12B") -or ($_.ID -eq "1EZ")}
+    try {
+        $Warlist = $WarReq.Warranty | Where-Object { ($_.ID -eq "36Y") -or ($_.ID -eq "3EZ") -or ($_.ID -eq "12B") -or ($_.ID -eq "1EZ") }
         $WarObj = [PSCustomObject]@{
-            'ServiceProvider'               = 'Lenovo'
-            'ServiceModel'                  = $WarReq.Product
-            'ServiceTag'                    = $SourceDevice
-            'ServiceLevelDescription'       = $Warlist.Name -join "`n"
-            'WarrantyStartDate'             = ($Warlist.Start | sort-object -Descending | select-object -last 1)
-            'WarrantyEndDate'               = ($Warlist.End | sort-object | select-object -last 1)
+            'ServiceProvider'         = 'Lenovo'
+            'ServiceModel'            = $WarReq.Product
+            'ServiceTag'              = $SourceDevice
+            'ServiceLevelDescription' = $Warlist.Name -join "`n"
+            'WarrantyStartDate'       = ($Warlist.Start | sort-object -Descending | select-object -last 1)
+            'WarrantyEndDate'         = ($Warlist.End | sort-object | select-object -last 1)
         }
 
-    }catch{
+    }
+    catch {
         $WarObj = [PSCustomObject]@{
-            'ServiceProvider'               = 'Lenovo'
-            'ServiceModel'                  = $null
-            'ServiceTag'                    = $SourceDevice
-            'ServiceLevelDescription'       = 'Could not get warranty information'
-            'WarrantyStartDate'             = $null
-            'WarrantyEndDate'               = $null
+            'ServiceProvider'         = 'Lenovo'
+            'ServiceModel'            = $null
+            'ServiceTag'              = $SourceDevice
+            'ServiceLevelDescription' = 'Could not get warranty information'
+            'WarrantyStartDate'       = $null
+            'WarrantyEndDate'         = $null
         }
     }
     return $WarObj  
@@ -525,23 +569,24 @@ function Get-LenovoWarranty([Parameter(Mandatory = $true)]$SourceDevice) {
 # Function to get Getac Warranty
 function Get-GetacWarranty([Parameter(Mandatory = $true)]$SourceDevice) {
     $WarReq = Invoke-RestMethod -Uri https://api.getac.us/rma-manager/rma/verify-serial?serial=$SerialNumber -Method Get -ContentType "application/json"
-    try{
+    try {
         $WarObj = [PSCustomObject]@{
-            'ServiceProvider'               = 'Getac'
-            'ServiceModel'                  = $WarReq.model
-            'ServiceTag'                    = $SourceDevice
-            'ServiceLevelDescription'       = $WarReq.warrantyType
-            'WarrantyStartDate'             = $null
-            'WarrantyEndDate'               = ($warreq.endDeviceWarranty | sort-object | select-object -last 1)
+            'ServiceProvider'         = 'Getac'
+            'ServiceModel'            = $WarReq.model
+            'ServiceTag'              = $SourceDevice
+            'ServiceLevelDescription' = $WarReq.warrantyType
+            'WarrantyStartDate'       = $null
+            'WarrantyEndDate'         = ($warreq.endDeviceWarranty | sort-object | select-object -last 1)
         }
-    }catch{
+    }
+    catch {
         $WarObj = [PSCustomObject]@{
-            'ServiceProvider'               = 'Getac'
-            'ServiceModel'                  = $null
-            'ServiceTag'                    = $SourceDevice
-            'ServiceLevelDescription'       = 'Could not get warranty information'
-            'WarrantyStartDate'             = $null
-            'WarrantyEndDate'               = $null
+            'ServiceProvider'         = 'Getac'
+            'ServiceModel'            = $null
+            'ServiceTag'              = $SourceDevice
+            'ServiceLevelDescription' = 'Could not get warranty information'
+            'WarrantyStartDate'       = $null
+            'WarrantyEndDate'         = $null
         }
     }
     return $WarObj
@@ -791,15 +836,14 @@ if ($CollectDeviceInventory) {
 
     
     # CollectMicrosoft365
-    if($CollectMicrosoft365){
+    if ($CollectMicrosoft365) {
         #Get Microsoft 365
         $Microsoft365Data = Get-Microsoft365
 
         #Creates an empty object to hold the data
         $Microsoft365 = New-Object -TypeName PSObject
 
-        if($Microsoft365Data)
-        {   
+        if ($Microsoft365Data) {   
             $Microsoft365 | Add-Member -MemberType NoteProperty -Name "InstalledVersion" -Value $Microsoft365Data.InstalledVersion
             $Microsoft365 | Add-Member -MemberType NoteProperty -Name "UpdateChannel" -Value $Microsoft365Data.UpdateChannel
             $Microsoft365 | Add-Member -MemberType NoteProperty -Name "LatestReleaseType" -Value $Microsoft365Data.LatestReleaseType
@@ -811,17 +855,17 @@ if ($CollectDeviceInventory) {
     }
 
     # CollectWarranty
-    if($CollectWarranty){
+    if ($CollectWarranty) {
         #Get Warranty Bios
         $WarrantyBios = Get-WmiObject Win32_Bios
         $WarrantyMake = $Bios.Manufacturer
         $WarrantySerialNumber = $Bios.SerialNumber
 
-        if ($WarrantyDellClientID -ne $null -and $WarrantyDellClientSecret -ne $null -and $WarrantyMake -eq "Dell Inc."){
+        if ($WarrantyDellClientID -ne $null -and $WarrantyDellClientSecret -ne $null -and $WarrantyMake -eq "Dell Inc.") {
             #write-host "Dell computer found" -ForegroundColor Green
             $WarrantyData = Get-DellWarranty -SourceDevice $WarrantySerialNumber
         } 
-        elseif($WarrantyLenovoClientID -ne $null -and $WarrantyMake -eq "LENOVO") {
+        elseif ($WarrantyLenovoClientID -ne $null -and $WarrantyMake -eq "LENOVO") {
             #write-host "LENOVO computer found" -ForegroundColor Green         
             $WarrantyData = Get-LenovoWarranty -SourceDevice $WarrantySerialNumber
         } 
@@ -829,7 +873,7 @@ if ($CollectDeviceInventory) {
             #write-host "Getac computer found" -ForegroundColor Green
             $WarrantyData = Get-GetacWarranty -SourceDevice $WarrantySerialNumber
         }
-        else{
+        else {
             #write-host "$Make warranty not supported" -ForegroundColor Red
             $WarrantyData = $null
         }
@@ -837,8 +881,7 @@ if ($CollectDeviceInventory) {
         # Create custom PSObject
         $Warranty = New-Object -TypeName PSObject
 
-        if($WarrantyData)
-        {
+        if ($WarrantyData) {
             $Warranty | Add-Member -MemberType NoteProperty -Name "ServiceProvider" -Value $WarrantyData.ServiceProvider
             $Warranty | Add-Member -MemberType NoteProperty -Name "ServiceModel" -Value $WarrantyData.ServiceModel
             $Warranty | Add-Member -MemberType NoteProperty -Name "ServiceTag" -Value $WarrantyData.ServiceTag
@@ -865,10 +908,10 @@ if ($CollectDeviceInventory) {
     $Inventory | Add-Member -MemberType NoteProperty -Name "DeviceManufacturer" -Value "$ComputerManufacturer" -Force
     $Inventory | Add-Member -MemberType NoteProperty -Name "DeviceModel" -Value "$ComputerModel" -Force
     $Inventory | Add-Member -MemberType NoteProperty -Name "Chassis" -Value $ChassisArrayList -Force
-    if($CollectMicrosoft365){
+    if ($CollectMicrosoft365) {
         $Inventory | Add-Member -MemberType NoteProperty -Name "Microsoft365" -Value $Microsoft365 -Force
     }
-    if($CollectWarranty){
+    if ($CollectWarranty) {
         $Inventory | Add-Member -MemberType NoteProperty -Name "Warranty" -Value $Warranty -Force
     }
 
@@ -884,10 +927,10 @@ if ($CollectDeviceInventory) {
     $MainDevice = New-Object -TypeName PSObject
     $MainDevice | Add-Member -MemberType NoteProperty -Name "ComputerName" -Value "$ComputerName" -Force
     $MainDevice | Add-Member -MemberType NoteProperty -Name "ManagedDeviceID" -Value "$ManagedDeviceID" -Force
-    if($CollectMicrosoft365){
+    if ($CollectMicrosoft365) {
         $MainDevice | Add-Member -MemberType NoteProperty -Name "Microsoft365" -Value $true -Force
     }
-    if($CollectWarranty){
+    if ($CollectWarranty) {
         $MainDevice | Add-Member -MemberType NoteProperty -Name "Warranty" -Value $true -Force
     }
 
@@ -1080,6 +1123,6 @@ if ($CollectDriverInventory) {
     }
 }
 Write-Output $OutputMessage
-Exit 0
+
 
 #endregion script
