@@ -48,10 +48,10 @@ Version: 5.0
 [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
 
 # Replace with your Log Analytics Workspace ID
-$CustomerId = "005d3d97-e21b-46fa-8e35-871b30f1112a"  
+$CustomerId = ""  
 
 # Replace with your Primary Key
-$SharedKey = "99WwZQX89DKVoDHpakV+pupfZAzQCy7gsZLep7uU6DMDECUeS4ReqsHW7BIZtUG7E/ihWdqrtWNg3xN1oQb4MQ=="
+$SharedKey = ""
 
 
 #Control if you want to collect Device, App, and Driver Inventory or both (True = Collect)
@@ -65,8 +65,8 @@ $CollectWarranty = $true
 
 #Warranty key
 #Warranty keys
-$WarrantyDellClientID = "l74bde028c7409499db86e07db0c9353bb"
-$WarrantyDellClientSecret = "1ca8193a83f8435cb950640e818b4c6b"
+$WarrantyDellClientID = ""
+$WarrantyDellClientSecret = ""
 $WarrantyLenovoClientID = $null
 
 # You can use an optional field to specify the timestamp from the data. If the time field is not specified, Azure Monitor assumes the time is the message ingestion time
