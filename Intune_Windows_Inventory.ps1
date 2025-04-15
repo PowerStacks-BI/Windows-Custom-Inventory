@@ -858,8 +858,8 @@ if ($CollectDeviceInventory) {
     if ($CollectWarranty) {
         #Get Warranty Bios
         $WarrantyBios = Get-WmiObject Win32_Bios
-        $WarrantyMake = $Bios.Manufacturer
-        $WarrantySerialNumber = $Bios.SerialNumber
+        $WarrantyMake = $WarrantyBios.Manufacturer
+        $WarrantySerialNumber = $WarrantyBios.SerialNumber
 
         if ($WarrantyDellClientID -ne $null -and $WarrantyDellClientSecret -ne $null -and $WarrantyMake -eq "Dell Inc.") {
             #write-host "Dell computer found" -ForegroundColor Green
