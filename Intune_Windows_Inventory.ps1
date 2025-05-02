@@ -61,9 +61,8 @@ $CollectDriverInventory = $true
 
 #Sub-Control under Device Inventory
 $CollectMicrosoft365 = $true
-$CollectWarranty = $true
+$CollectWarranty = $false
 
-#Warranty key
 #Warranty keys
 $WarrantyDellClientID = ""
 $WarrantyDellClientSecret = ""
