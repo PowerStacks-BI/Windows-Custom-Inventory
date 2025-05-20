@@ -120,6 +120,55 @@ function Get-InstalledApplications() {
     Return $Apps
 }
 
+# Function to get all Appx Installed Application
+Function Get-AppxInstalledApplications(){
+    param(
+        [string]$UserSid
+    )
+
+    if($UserSid)
+    {
+        $appPackages = Get-AppxPackage -User $UserSid | . { process { if ($_.Name) { $_ } } } | Sort-Object Name
+
+        $appPackagesWithPublisher = $appPackages | ForEach-Object {
+            if($_.PackageFullName){
+                $manifest = Get-AppxPackageManifest -Package $_.PackageFullName
+                $publisher = $manifest.Package.Properties.PublisherDisplayName
+                    [PSCustomObject]@{
+                        DisplayName = $_.Name
+                        DisplayVersion = $_.Version
+                        Publisher = $publisher
+                    }
+            }
+            else
+            {
+                #Do nothing.
+            }
+        }
+    }
+    else
+    {
+        $appPackages = Get-AppxPackage | . { process { if ($_.Name) { $_ } } } | Sort-Object Name
+
+        $appPackagesWithPublisher = $appPackages | ForEach-Object {
+            if($_.PackageFullName){
+                $manifest = Get-AppxPackageManifest -Package $_.PackageFullName
+                $publisher = $manifest.Package.Properties.PublisherDisplayName
+                    [PSCustomObject]@{
+                        DisplayName = $_.Name
+                        DisplayVersion = $_.Version
+                        Publisher = $publisher
+                    }
+            }
+            else
+            {
+                #Do nothing.
+            }
+        }
+    } 
+    Return $appPackagesWithPublisher
+}
+
 # Function to get Microsoft 365
 function Get-Microsoft365() {
     ### Check for Click-to-Run Office
@@ -973,6 +1022,8 @@ if ($CollectAppInventory) {
 
     #Get Apps for system and current user
     $MyApps = Get-InstalledApplications -UserSid $UserSid
+    $MyAppsAppx = Get-AppxInstalledApplications -UserSid $UserSid
+    $MyApps += $MyAppsAppx
     $UniqueApps = ($MyApps | Group-Object Displayname | Where-Object { $_.Count -eq 1 } ).Group
     $DuplicatedApps = ($MyApps | Group-Object Displayname | Where-Object { $_.Count -gt 1 } ).Group
     $NewestDuplicateApp = ($DuplicatedApps | Group-Object DisplayName) | ForEach-Object { $_.Group | Sort-Object [version]DisplayVersion -Descending | Select-Object -First 1 }
