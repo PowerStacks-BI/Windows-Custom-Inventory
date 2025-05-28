@@ -1,58 +1,12 @@
-﻿<#
-.SYNOPSIS
-This script collects application and device inventory data from Windows machines and sends the data to Azure Log Analytics.
-
-.DESCRIPTION
-The script gathers detailed information about installed applications and hardware inventory, including device information, memory, CPU, monitor details, and physical disk details. The data is then compressed, encoded in Base64, and sent to an Azure Log Analytics workspace for further analysis and reporting.
-
-.PARAMETER CustomerId
-The Log Analytics Workspace ID.
-
-.PARAMETER SharedKey
-The Primary Key for the Log Analytics Workspace.
-
-.PARAMETER CollectDeviceInventory
-Boolean parameter to specify whether to collect device inventory. Default is $true.
-
-.PARAMETER CollectAppInventory
-Boolean parameter to specify whether to collect application inventory. Default is $true.
-
-.PARAMETER TimeStampField
-Optional field to specify the timestamp from the data. If not specified, Azure Monitor assumes the ingestion time as the timestamp.
-
-.PARAMETER RemoveBuiltInMonitors
-Boolean parameter to specify whether to remove built-in monitors from the inventory. Default is $true.
-
-.PARAMETER InventoryDateFormat
-Format string for the inventory date. Default is "MM-dd HH:mm".
-
-.EXAMPLE
-.\InventoryCollector.ps1 -CustomerId "<YourWorkspaceID>" -SharedKey "<YourPrimaryKey>"
-
-.NOTES
-The script requires PowerShell 5.1 or later and the Azure Log Analytics workspace credentials.
-
-Script Name: InventoryCollector.ps1
-Date: 4/12/2025
-Version: 5.0
-
-# LEGAL DISCLAIMER
-# This script is provided "as is" without any warranty of any kind, either express or implied, including but not limited to the implied warranties of merchantability, fitness for a particular purpose, or non-infringement. The entire risk as to the quality and performance of the script is with you.
-# In no event shall the authors or copyright holders be liable for any claim, damages, or other liability, whether in an action of contract, tort, or otherwise, arising from, out of, or in connection with the script or the use or other dealings in the script.
-# You should never run any script from the Internet without understanding its contents and effects. It is highly recommended that you thoroughly test the script in a safe environment before running it in production.
-#>
-
-
 #region initialize
 # Enable TLS 1.2 support
 [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
 
 # Replace with your Log Analytics Workspace ID
-$CustomerId = ""  
+$CustomerId = "<EnterYourLogAnalyticsWorkspaceID>"   
 
 # Replace with your Primary Key
-$SharedKey = ""
-
+$SharedKey = "<EnterYourLogAnalyicsPrimarKey>"
 
 #Control if you want to collect Device, App, and Driver Inventory or both (True = Collect)
 $CollectDeviceInventory = $true
@@ -61,12 +15,12 @@ $CollectDriverInventory = $true
 
 #Sub-Control under Device Inventory
 $CollectMicrosoft365 = $true
-$CollectWarranty = $false
+$CollectWarranty = $false # Keep false for standard inventory. Change to $true or once per month warranty data.
 
 #Warranty keys
-$WarrantyDellClientID = ""
-$WarrantyDellClientSecret = ""
-$WarrantyLenovoClientID = $null
+$WarrantyDellClientID = "<EnterYourDellClientID>"
+$WarrantyDellClientSecret = "EnterYourDellClientSecret"
+$WarrantyLenovoClientID = "EntrYourLenovoClientID"
 
 # You can use an optional field to specify the timestamp from the data. If the time field is not specified, Azure Monitor assumes the time is the message ingestion time
 # DO NOT DELETE THIS VARIABLE. Recommened keep this blank.
@@ -79,6 +33,13 @@ $RemoveBuiltInMonitors = $false
 $InventoryDateFormat = "MM-dd HH:mm"
 
 #endregion initialize
+
+# Start Logging
+$Now = Get-Date -Format "yyyy-MM-dd_HHmm"
+$logPath = "C:\Windows\Logs\Intune_Inventory_$Now.log"
+Start-Transcript -Path $logPath -Append
+
+
 
 #region functions
 
@@ -120,244 +81,203 @@ function Get-InstalledApplications() {
     Return $Apps
 }
 
-# Function to get Microsoft 365
-function Get-Microsoft365() {
-    ### Check for Click-to-Run Office
+function Get-Microsoft365 {
     $IsC2R = Test-Path 'HKLM:\SOFTWARE\Microsoft\Office\ClickToRun'
-    if ($IsC2R) {
-        try {
-            $OfficeVersion = [version](Get-ItemProperty -Path 'HKLM:\SOFTWARE\Microsoft\Office\ClickToRun\Configuration' -ErrorAction Stop | Select-Object -ExpandProperty VersionToReport)
-            $OfficeProductIds = (Get-ItemProperty -Path 'HKLM:\SOFTWARE\Microsoft\Office\ClickToRun\Configuration' -ErrorAction Stop | Select-Object -ExpandProperty ProductReleaseIds)
-        }
-        catch {
-            Write-Output "Failed to retrieve Office version or product IDs: $_"
-            $OfficeVersion = $null
-            $OfficeProductIds = $null
-        }
+    if (-not $IsC2R) { Write-Output "Not Click-to-Run Office"; return $null }
+
+    try {
+        $ConfigPath = 'HKLM:\SOFTWARE\Microsoft\Office\ClickToRun\Configuration'
+        $OfficeVersion = [version](Get-ItemProperty -Path $ConfigPath -ErrorAction Stop | Select-Object -ExpandProperty VersionToReport)
+        $OfficeProductIds = (Get-ItemProperty -Path $ConfigPath -ErrorAction Stop | Select-Object -ExpandProperty ProductReleaseIds)
+        $OfficeVersionString = $OfficeVersion.ToString()
+        Write-Output "Installed Version: $OfficeVersionString"
     }
-    else {
-        #Write-Output "No Click-to-Run Office detected. Setting default values."
-        $OfficeVersion = $null
-        $OfficeProductIds = $null
+    catch {
+        Write-Output "Failed to read Office configuration: $_"
+        return $null
     }
 
-    ### Determine if it’s Microsoft 365
     $IsM365 = ($OfficeProductIds -like '*O365*') -or ($OfficeProductIds -like '*M365*')
 
-    ### Define update channels (corrected syntax)
     $Channels = @(
-        @{ GUID = '492350f6-3a01-4f97-b9c0-c7c6ddf67d60'; PathPart = 'Monthly'; GPO = 'Current'; ID = 'Current'; Name = 'Monthly' }
-        @{ GUID = '64256afe-f5d9-4f86-8936-8840a6a4f5be'; PathPart = 'MonthlyPreview'; GPO = 'FirstReleaseCurrent'; ID = 'CurrentPreview'; Name = 'Monthly (Preview)'; AlternateNames = @('InsiderSlow', 'FirstReleaseCurrent', 'Insiders') }
-        @{ GUID = '55336b82-a18d-4dd6-b5f6-9e5095c314a6'; PathPart = 'MonthlyEnterpriseChannel'; GPO = 'MonthlyEnterprise'; ID = 'MonthlyEnterprise'; Name = 'MEC' }
-        @{ GUID = '7ffbc6bf-bc32-4f92-8982-f9dd17fd3114'; PathPart = 'SAC'; GPO = 'Deferred'; ID = 'SemiAnnual'; Name = 'SAC'; AlternateNames = @('Deferred', 'Broad') }
-        @{ GUID = 'b8f9b850-328d-4355-9145-c59439a0c4cf'; PathPart = 'SACT'; GPO = 'FirstReleaseDeferred'; ID = 'SemiAnnualPreview'; Name = 'SACT'; AlternateNames = @('FirstReleaseDeferred', 'Targeted') }
-        @{ GUID = '5030841d-c919-4594-8d2d-84ae4f96e58e'; PathPart = 'LTSB2021'; ID = 'PerpetualVL2021'; Name = 'LTSB2021'; AlternateNames = @('Perpetual2021') }
-        @{ GUID = 'f2e724c1-748f-4b47-8fb8-8e0d210e9208'; PathPart = 'LTSB'; ID = 'PerpetualVL2019'; Name = 'LTSB'; AlternateNames = @('Perpetual2019') }
-        @{ GUID = '5440fd1f-7ecb-4221-8110-145efaa6372f'; PathPart = 'Beta'; GPO = 'InsiderFast'; ID = 'BetaChannel'; Name = 'Beta' }
+        @{ GUID = '492350f6-3a01-4f97-b9c0-c7c6ddf67d60'; Name = 'Monthly'; GPO = 'Current' }
+        @{ GUID = '64256afe-f5d9-4f86-8936-8840a6a4f5be'; Name = 'Monthly (Preview)'; GPO = 'FirstReleaseCurrent' }
+        @{ GUID = '55336b82-a18d-4dd6-b5f6-9e5095c314a6'; Name = 'Monthly Enterprise'; GPO = 'MonthlyEnterprise' }
+        @{ GUID = '7ffbc6bf-bc32-4f92-8982-f9dd17fd3114'; Name = 'Semi-Annual'; GPO = 'Deferred' }
+        @{ GUID = 'b8f9b850-328d-4355-9145-c59439a0c4cf'; Name = 'Semi-Annual (Preview)'; GPO = 'FirstReleaseDeferred' }
+        @{ GUID = '5440fd1f-7ecb-4221-8110-145efaa6372f'; Name = 'Beta'; GPO = 'InsiderFast' }
     )
 
-    ### Default channel if not determined
-    $OfficeChannel = @{ Name = $null; PathPart = $null }
-
-    ### Detect update channel for M365
-    if ($IsM365 -and $IsC2R) {
-        $OfficeUpdateChannelGPO = (Get-ItemProperty -Path 'HKLM:\SOFTWARE\Policies\Microsoft\Office\16.0\Common\OfficeUpdate' -ErrorAction 'SilentlyContinue' | Select-Object -ExpandProperty UpdateBranch -ErrorAction 'SilentlyContinue')
-        if ($OfficeUpdateChannelGPO) {
-            Write-Output 'Office is configured to use a GPO update channel.'
-            foreach ($Channel in $Channels) {
-                if ($OfficeUpdateChannelGPO -eq $Channel.GPO) { $OfficeChannel = $Channel }
+    $OfficeChannel = @{ Name = $null }
+    $UpdateBranch = (Get-ItemProperty -Path 'HKLM:\SOFTWARE\Policies\Microsoft\Office\16.0\Common\OfficeUpdate' -ErrorAction SilentlyContinue).UpdateBranch
+    if ($UpdateBranch) {
+        $OfficeChannel = $Channels | Where-Object { $_.GPO -eq $UpdateBranch }
+        Write-Output "Update channel from GPO: $($UpdateBranch): $($OfficeChannel.Name)"
+    }
+    else {
+        $CDNBaseUrl = (Get-ItemProperty -Path $ConfigPath -ErrorAction SilentlyContinue).CDNBaseUrl
+        if ($CDNBaseUrl) {
+            try {
+                $Uri = [System.Uri]$CDNBaseUrl
+                $Guid = $Uri.Segments[2].TrimEnd('/')
+                $OfficeChannel = $Channels | Where-Object { $_.GUID -eq $Guid }
+                Write-Output "Update channel from CDN GUID: $Guid → $($OfficeChannel.Name)"
+            }
+            catch {
+                Write-Output "Failed to parse CDNBaseUrl for channel"
             }
         }
-        else {
-            $C2RConfigurationPath = 'HKLM:\SOFTWARE\Microsoft\Office\ClickToRun\Configuration'
-            Write-Output 'Office is not configured to use a GPO update channel.'
-            $OfficeUpdateURL = [System.Uri](Get-ItemProperty -Path $C2RConfigurationPath -ErrorAction 'SilentlyContinue' | Select-Object -ExpandProperty UpdateURL -ErrorAction 'SilentlyContinue')
-            $OfficeUnmanagedUpdateURL = [System.Uri](Get-ItemProperty -Path $C2RConfigurationPath -ErrorAction 'SilentlyContinue' | Select-Object -ExpandProperty UnmanagedUpdateURL -ErrorAction 'SilentlyContinue')
-            $OfficeUpdateChannelCDNURL = [System.Uri](Get-ItemProperty -Path $C2RConfigurationPath -ErrorAction 'SilentlyContinue' | Select-Object -ExpandProperty CDNBaseUrl -ErrorAction 'SilentlyContinue')
-            if ($OfficeUpdateURL.IsAbsoluteUri) { $OfficeUpdateGUID = $OfficeUpdateURL.Segments[2] }
-            elseif ($OfficeUnmanagedUpdateURL.IsAbsoluteUri) { $OfficeUpdateGUID = $OfficeUnmanagedUpdateURL.Segments[2] }
-            elseif ($OfficeUpdateChannelCDNURL.IsAbsoluteUri) { $OfficeUpdateGUID = $OfficeUpdateChannelCDNURL.Segments[2] }
+    }
+
+    $ChannelPathMap = @{
+        'Monthly'               = 'Monthly'
+        'Monthly (Preview)'     = 'MonthlyPreview'
+        'Monthly Enterprise'    = 'MonthlyEnterpriseChannel'
+        'Semi-Annual'           = 'SAC'
+        'Semi-Annual (Preview)' = 'SACT'
+        'Beta'                  = 'Beta'
+    }
+
+    if ($OfficeProductIds -like '*2019Volume*') {
+        $CDNChannel = 'LTSB'
+        Write-Output "Legacy Office 2019 detected"
+    }
+    elseif ($OfficeProductIds -like '*2021Volume*') {
+        $CDNChannel = 'LTSB2021'
+        Write-Output "Legacy Office 2021 detected"
+    }
+    else {
+        $CDNChannel = $ChannelPathMap[$OfficeChannel.Name]
+    }
+
+    Write-Output "CDN channel path: $CDNChannel"
+
+
+    ### Defaults
+    $LatestReleaseType = $null
+    $LatestReleaseVersion = $null
+    $EndOfSupportDate = $null
+    $ReleaseDate = $null
+    $ReleaseID = $null
+
+    try {
+        $C2RData = Invoke-RestMethod -Uri 'https://mrodevicemgr.officeapps.live.com/mrodevicemgrsvc/api/v2/C2RReleaseData' -Method GET -ErrorAction Stop
+        $ReleaseMatch = $C2RData | Where-Object { $_.availableBuild -eq $OfficeVersionString }
+
+
+        if (-not $ReleaseMatch) {
+            $ReleaseMatch = $C2RData |
+                Where-Object { $_.availableBuild -like "$($OfficeVersion.Major).$($OfficeVersion.Minor).*" } |
+                Sort-Object availableBuild -Descending |
+                Select-Object -First 1
+            Write-Output "Fuzzy match used for release data"
+        }
+
+        # If ReleaseMatch is an array, pick the first match
+        if ($ReleaseMatch -is [array]) {
+            Write-Output "`n=== Raw C2R Match Array ==="
+            $ReleaseMatch | ConvertTo-Json -Depth 5 | Out-String | Write-Output
+            Write-Output "=== End Raw C2R Match Array ===`n"
+
+            if ($ReleaseMatch.Count -gt 0) {
+                Write-Output "Multiple matches found. Using first: $($ReleaseMatch[0].availableBuild)"
+                $ReleaseMatch = $ReleaseMatch[0]
+            }
             else {
-                Write-Output "Unable to determine Office update channel URL. Using default."
-            }
-            foreach ($Channel in $Channels) {
-                if ($OfficeUpdateGUID -eq $Channel.GUID) { $OfficeChannel = $Channel }
+                Write-Output "ReleaseMatch was empty array"
+                $ReleaseMatch = $null
             }
         }
-        Write-Output ("{0} found using the {1} update channel. Channel ID: {2}. Detected Version: {3}" -f 'Microsoft 365 Apps', $OfficeChannel.Name, $OfficeChannel.ID, $OfficeVersion)
-    }
 
-    ### Get latest security update info
-    if ($OfficeVersion.Major -eq 16 -and $IsC2R) {
-        if ($IsM365) {
-            $ChannelURLPathPart = $OfficeChannel.PathPart
-            try {
-                $UpdateAPIURL = "https://clients.config.office.net/releases/v1.0/LatestRelease/$ChannelURLPathPart`?ReleaseType=security"
-                $ReleaseInfo = Invoke-RestMethod -Uri $UpdateAPIURL -Method 'GET' -ErrorAction 'Stop'
-                if (-not $ReleaseInfo) {
-                    $UpdateAPIURL = "https://clients.config.office.net/releases/v1.0/LatestRelease/$ChannelURLPathPart`?ReleaseType="
-                    $ReleaseInfo = Invoke-RestMethod -Uri $UpdateAPIURL -Method 'GET' -ErrorAction 'Stop'
-                }
+        if ($ReleaseMatch) {
+            Write-Output "`n=== Raw Single C2R Match ==="
+            $ReleaseMatch | ConvertTo-Json -Depth 5 | Out-String | Write-Output
+            Write-Output "=== End Raw C2R Match ===`n"
+            Write-Output "C2R Match found: $($ReleaseMatch.availableBuild)"
+
+            $LatestReleaseVersion = "$($ReleaseMatch.availableBuild)"
+            $LatestReleaseType = "$($ReleaseMatch.type)"
+            $ReleaseDate = "$($ReleaseMatch.updatedTimeUtc)"
+            $ReleaseID = ($ReleaseMatch.forkName -split '-')[0]
+
+            if ($ReleaseMatch.endOfSupportDate -and $ReleaseMatch.endOfSupportDate -ne '0001-01-01T00:00:00Z') {
+                $EndOfSupportDate = "$($ReleaseMatch.endOfSupportDate)"
             }
-            catch {
-                Write-Output "Unable to get latest update info: $_"
-                $ReleaseInfo = [PSCustomObject]@{
-                    releaseType      = $null
-                    buildVersion     = $null
-                    endOfSupportDate = $null
-                    availabilityDate = $null
-                    releaseVersion   = $null
-                }
-            }
-        }
-        elseif ($OfficeProductIds -like '*2019Volume*') {
-            try {
-                $UpdateAPIURL = 'https://clients.config.office.net/releases/v1.0/LatestRelease/LTSB?ReleaseType=security'
-                $ReleaseInfo = Invoke-RestMethod -Uri $UpdateAPIURL -Method 'GET' -ErrorAction 'Stop'
-                if (-not $ReleaseInfo) {
-                    $UpdateAPIURL = 'https://clients.config.office.net/releases/v1.0/LatestRelease/LTSB?ReleaseType='
-                    $ReleaseInfo = Invoke-RestMethod -Uri $UpdateAPIURL -Method 'GET' -ErrorAction 'Stop'
-                }
-            }
-            catch {
-                Write-Output "Unable to get latest update info: $_"
-                $ReleaseInfo = [PSCustomObject]@{
-                    releaseType      = $null
-                    buildVersion     = $null
-                    endOfSupportDate = $null
-                    availabilityDate = $null
-                    releaseVersion   = $null
-                }
-            }
-        }
-        elseif ($OfficeProductIds -like '*2021Volume*') {
-            try {
-                $UpdateAPIURL = 'https://clients.config.office.net/releases/v1.0/LatestRelease/LTSB2021?ReleaseType=security'
-                $ReleaseInfo = Invoke-RestMethod -Uri $UpdateAPIURL -Method 'GET' -ErrorAction 'Stop'
-                if (-not $ReleaseInfo) {
-                    $UpdateAPIURL = 'https://clients.config.office.net/releases/v1.0/LatestRelease/LTSB2021?ReleaseType='
-                    $ReleaseInfo = Invoke-RestMethod -Uri $UpdateAPIURL -Method 'GET' -ErrorAction 'Stop'
-                }
-            }
-            catch {
-                Write-Output "Unable to get latest update info: $_"
-                $ReleaseInfo = [PSCustomObject]@{
-                    releaseType      = $null
-                    buildVersion     = $null
-                    endOfSupportDate = $null
-                    availabilityDate = $null
-                    releaseVersion   = $null
-                }
+            else {
+                Write-Output "EndOfSupportDate not found in C2R fallback needed"
             }
         }
         else {
-            Write-Output "Non-M365/Volume Office detected. Setting default release info."
-            $ReleaseInfo = [PSCustomObject]@{
-                releaseType      = $null
-                buildVersion     = $null
-                endOfSupportDate = $null
-                availabilityDate = $null
-                releaseVersion   = $null
+            Write-Output "No C2R match found"
+        }
+    }
+    catch {
+        Write-Warning "C2R API failed: $_"
+    }
+
+
+    if ($CDNChannel) {
+        try {
+            $CDNUrl = "https://clients.config.office.net/releases/v1.0/LatestRelease/$CDNChannel"
+            $CDNResp = Invoke-RestMethod -Uri $CDNUrl -Method GET -ErrorAction Stop
+
+            if (-not $EndOfSupportDate -and $CDNResp.endOfSupportDate -ne '0001-01-01T00:00:00Z') {
+                $EndOfSupportDate = $CDNResp.endOfSupportDate
+                Write-Output "EndOfSupportDate pulled from CDN: $EndOfSupportDate"
             }
+
+            if (-not $ReleaseDate -and $CDNResp.availabilityDate) {
+                $ReleaseDate = $CDNResp.availabilityDate
+                Write-Output "ReleaseDate pulled from CDN"
+            }
+
+            if (-not $LatestReleaseVersion -and $CDNResp.buildVersion.buildVersionString) {
+                $LatestReleaseVersion = $CDNResp.buildVersion.buildVersionString
+                Write-Output "ReleaseVersion pulled from CDN"
+            }
+
+            if (-not $ReleaseID -and $CDNResp.releaseVersion) {
+                $ReleaseID = $CDNResp.releaseVersion
+                Write-Output "ReleaseID pulled from CDN"
+            }
+
+            if (-not $LatestReleaseType -or $LatestReleaseType -eq 'Default') {
+                $ReleaseTypes = @{ 1 = 'Feature Update'; 2 = 'Quality Update'; 3 = 'Security Update' }
+                $LatestReleaseType = $ReleaseTypes[$CDNResp.releaseType]
+                if (-not $LatestReleaseType -and $CDNResp.releaseType -ne $null) {
+                    $LatestReleaseType = "$($CDNResp.releaseType)"  # fallback to raw value
+                }
+                Write-Output "ReleaseType pulled from CDN: $LatestReleaseType"
+            }
+
+        }
+        catch {
+            Write-Warning "CDN API failed: $_"
         }
     }
-    else {
-        $ReleaseInfo = [PSCustomObject]@{
-            releaseType      = $null
-            buildVersion     = $null
-            endOfSupportDate = $null
-            availabilityDate = $null
-            releaseVersion   = $null
-        }
+
+    Write-Output "FINAL: Installed=$OfficeVersionString | Channel=$($OfficeChannel.Name) | Release=$LatestReleaseVersion | Type=$LatestReleaseType | EoS=$EndOfSupportDate"
+
+    return [pscustomobject]@{
+        InstalledVersion     = $OfficeVersionString
+        UpdateChannel        = $OfficeChannel.Name
+        LatestReleaseType    = $LatestReleaseType
+        LatestReleaseVersion = $LatestReleaseVersion
+        EndOfSupportDate     = $EndOfSupportDate
+        ReleaseDate          = $ReleaseDate
+        ReleaseID            = $ReleaseID
     }
-
-    ### Process release data
-    $ReleaseTypes = @{
-        1 = 'Feature Update'
-        2 = 'Quality Update'
-        3 = 'Security Update'
-    }
-    $Today = Get-Date
-    $ReleaseType = if ($ReleaseTypes.ContainsKey([int32]$ReleaseInfo.releaseType)) { $ReleaseTypes[[int32]$ReleaseInfo.releaseType] } else { $null }
-    $TargetVersion = [Version]$ReleaseInfo.buildVersion.buildVersionString
-
-    ### Determine status
-    if ($IsC2R) {  
-
-        ### Preprocess data
-        $InstalledVersion = if ($OfficeVersion) { 
-            $OfficeVersion.ToString() 
-        }
-        else { 
-            $null
-        }
-
-        $UpdateChannel = if ($OfficeChannel.Name) { 
-            $OfficeChannel.Name
-        }
-        else { 
-            $null
-        }
-
-        $LatestReleaseType = if ($ReleaseType) { 
-            $ReleaseType.ToString() 
-        }
-        else { 
-            $null
-        }
-
-        $LatestReleaseVersion = if ($TargetVersion) { 
-            $TargetVersion.ToString() 
-        }
-        else { 
-            $null
-        }
-
-        $EndOfSupportDate = if ($null -ne $ReleaseInfo.endOfSupportDate -and $ReleaseInfo.endOfSupportDate -ne '0001-01-01T00:00:00Z') { 
-            $ReleaseInfo.endOfSupportDate.ToString() 
-        }
-        else { 
-            $null 
-        }
-
-        $ReleaseDate = if ($ReleaseInfo -and $ReleaseInfo.availabilityDate -and $ReleaseInfo.availabilityDate -ne '0001-01-01T00:00:00Z') { 
-            $ReleaseInfo.availabilityDate.ToString() 
-        }
-        else { 
-            $null 
-        }
-
-        $ReleaseID = if ($ReleaseInfo -and $ReleaseInfo.releaseVersion) { 
-            $ReleaseInfo.releaseVersion.ToString()
-        }
-        else { 
-            $null 
-        }
-
-        ### Create data hashtable
-        $OfficeVersionData = @{
-            'InstalledVersion'     = $InstalledVersion
-            'UpdateChannel'        = $UpdateChannel
-            'LatestReleaseType'    = $LatestReleaseType
-            'LatestReleaseVersion' = $LatestReleaseVersion
-            'EndOfSupportDate'     = $EndOfSupportDate
-            'ReleaseDate'          = $ReleaseDate
-            'ReleaseID'            = $ReleaseID
-        }
-    }
-    else {
-        $OfficeVersionData = $null
-    }
-
-    Return $OfficeVersionData
 }
+
 
 # Function to get Installed Drivers
 <#
 Feel free to edit the query user to collect drivers.
 #>
 function Get-InstalledDrivers() {
+    Write-Output "Begin getting installed drivers"
     # Get PnP signed drivers
+    Write-Output "Get PnP signed drivers"
     $PNPSigned_Drivers = Get-CimInstance -ClassName Win32_PnPSignedDriver | Where-Object {
         ($_.Manufacturer -ne "Microsoft") -and 
         ($_.DriverProviderName -ne "Microsoft") -and 
@@ -366,12 +286,14 @@ function Get-InstalledDrivers() {
     $PNPSigned_Drivers
 
     # Get installed MSU packages
+    Write-Output "Get installed MSU packages"
     $InstalledDrivers = Get-Package -ProviderName msu | Where-Object {
         $_.Metadata.Item("SupportUrl") -match "target=hub"
     }
     $InstalledDrivers
 
     # Get optional updates
+    Write-Output "Get optional updates"
     $updateSession = New-Object -ComObject Microsoft.Update.Session
     $updateSearcher = $updateSession.CreateUpdateSearcher()
     $searchResult = $updateSearcher.Search("IsInstalled=0 AND Type='Driver'")
@@ -401,9 +323,9 @@ function Get-InstalledDrivers() {
 
     # Link installed drivers
     $LinkedDrivers = foreach ($installedDriver in $InstalledDrivers) {
-        Write-Host "Attempting to link driver: $installedDriver"
+        Write-Output "Attempting to link driver: $installedDriver"
         $versionFromName = $installedDriver.Name.Split()[-1]
-        Write-Host "Driver version from name: $versionFromName"
+        Write-Output "Driver version from name: $versionFromName"
         $matchingDriver = $PNPSigned_Drivers | Where-Object {
             $_.DriverVersion -eq $versionFromName
         } | Select-Object -First 1
@@ -836,7 +758,8 @@ if ($CollectDeviceInventory) {
     
     # CollectMicrosoft365
     if ($CollectMicrosoft365) {
-        #Get Microsoft 365
+        # Get Microsoft 365
+        Write-Output 'Get Microsoft 365'
         $Microsoft365Data = Get-Microsoft365
 
         #Creates an empty object to hold the data
@@ -855,25 +778,26 @@ if ($CollectDeviceInventory) {
 
     # CollectWarranty
     if ($CollectWarranty) {
-        #Get Warranty Bios
+        Write-Output "Collect Warranty"
+        # Get Warranty Bios
         $WarrantyBios = Get-WmiObject Win32_Bios
         $WarrantyMake = $WarrantyBios.Manufacturer
         $WarrantySerialNumber = $WarrantyBios.SerialNumber
 
         if ($WarrantyDellClientID -ne $null -and $WarrantyDellClientSecret -ne $null -and $WarrantyMake -eq "Dell Inc.") {
-            #write-host "Dell computer found" -ForegroundColor Green
+            #Write-Output "Dell computer found" -ForegroundColor Green
             $WarrantyData = Get-DellWarranty -SourceDevice $WarrantySerialNumber
         } 
         elseif ($WarrantyLenovoClientID -ne $null -and $WarrantyMake -eq "LENOVO") {
-            #write-host "LENOVO computer found" -ForegroundColor Green         
+            #Write-Output "LENOVO computer found" -ForegroundColor Green         
             $WarrantyData = Get-LenovoWarranty -SourceDevice $WarrantySerialNumber
         } 
         elseif ($GetacWarranty -and $WarrantyMake -eq "INSYDE Corp.") {
-            #write-host "Getac computer found" -ForegroundColor Green
+            #Write-Output "Getac computer found" -ForegroundColor Green
             $WarrantyData = Get-GetacWarranty -SourceDevice $WarrantySerialNumber
         }
         else {
-            #write-host "$Make warranty not supported" -ForegroundColor Red
+            #Write-Output "$Make warranty not supported" -ForegroundColor Red
             $WarrantyData = $null
         }
 
@@ -954,14 +878,15 @@ if ($CollectDeviceInventory) {
     # Submit the data to the API endpoint
     $ResponseDeviceInventory = Send-LogAnalyticsData -customerId $customerId -sharedKey $sharedKey -body ([System.Text.Encoding]::UTF8.GetBytes($DeviceJson)) -logType $DeviceLog
 }
-#endregion DEVICEINVENTORY
+# end region DEVICEINVENTORY
 
-#region APPINVENTORY
+# region APPINVENTORY
 if ($CollectAppInventory) {
+    Write-Output "Collect App Inventory"
     #Set Name of Log
     $AppLog = "PowerStacksAppInventory"
 
-    #Get SID of current interactive users
+    # Get SID of current interactive users
     $CurrentLoggedOnUser = (Get-WmiObject -Class win32_computersystem).UserName
     if ($CurrentLoggedOnUser -eq $null) {
         $CurrentOwner = Get-CimInstance Win32_Process -Filter 'name = "explorer.exe"' | Invoke-CimMethod -MethodName getowner
@@ -971,7 +896,7 @@ if ($CollectAppInventory) {
     $strSID = $AdObj.Translate([System.Security.Principal.SecurityIdentifier])
     $UserSid = $strSID.Value
 
-    #Get Apps for system and current user
+    # Get Apps for system and current user
     $MyApps = Get-InstalledApplications -UserSid $UserSid
     $UniqueApps = ($MyApps | Group-Object Displayname | Where-Object { $_.Count -eq 1 } ).Group
     $DuplicatedApps = ($MyApps | Group-Object Displayname | Where-Object { $_.Count -gt 1 } ).Group
@@ -1024,10 +949,11 @@ if ($CollectAppInventory) {
     # Submit the data to the API endpoint
     $ResponseAppInventory = Send-LogAnalyticsData -customerId $customerId -sharedKey $sharedKey -body ([System.Text.Encoding]::UTF8.GetBytes($AppJson)) -logType $AppLog
 }
-#endregion APPINVENTORY
+# end region APPINVENTORY
 
-#region DRIVERINVENTORY
+# region DRIVERINVENTORY
 if ($CollectDriverInventory) {
+    Write-Output "Collect Driver Inventory"
     #Set Name of Log
     $DriverLog = "PowerStacksDriverInventory"
 
@@ -1090,7 +1016,8 @@ if ($CollectDriverInventory) {
 }
 #endregion DRIVERINVENTORY
 
-#Report back status
+# Report back status
+Write-Output "Report back status"
 $date = (Get-Date).ToUniversalTime().ToString($InventoryDateFormat)
 $OutputMessage = "InventoryDate: $date "
 
@@ -1123,5 +1050,5 @@ if ($CollectDriverInventory) {
 }
 Write-Output $OutputMessage
 
-
+Stop-Transcript
 #endregion script
