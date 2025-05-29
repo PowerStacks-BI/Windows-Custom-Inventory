@@ -6,7 +6,7 @@
 $CustomerId = "<EnterYourLogAnalyticsWorkspaceID>"   
 
 # Replace with your Primary Key
-$SharedKey = "<EnterYourLogAnalyicsPrimarKey>"
+$SharedKey = "<EnterYourLogAnalyicsPrimaryKey>"
 
 #Control if you want to collect Device, App, and Driver Inventory or both (True = Collect)
 $CollectDeviceInventory = $true
@@ -20,7 +20,7 @@ $CollectWarranty = $false # Keep false for standard inventory. Change to $true o
 #Warranty keys
 $WarrantyDellClientID = "<EnterYourDellClientID>"
 $WarrantyDellClientSecret = "EnterYourDellClientSecret"
-$WarrantyLenovoClientID = "EntrYourLenovoClientID"
+$WarrantyLenovoClientID = "EnterYourLenovoClientID"
 
 # You can use an optional field to specify the timestamp from the data. If the time field is not specified, Azure Monitor assumes the time is the message ingestion time
 # DO NOT DELETE THIS VARIABLE. Recommened keep this blank.
@@ -81,6 +81,62 @@ function Get-InstalledApplications() {
     Return $Apps
 }
 
+# Function to get deduplicated Appx Installed Applications (UWP)
+Function Get-AppxInstalledApplications() {
+    # Fix for issue which breaks Get-AppxPackage in Win11 24H2
+    Add-Type -AssemblyName "System.EnterpriseServices"
+    $publish = [System.EnterpriseServices.Internal.Publish]::new()
+
+    $dlls = @(
+        'System.Memory.dll',
+        'System.Numerics.Vectors.dll',
+        'System.Runtime.CompilerServices.Unsafe.dll',
+        'System.Security.Principal.Windows.dll'
+    )
+
+    foreach ($dll in $dlls) {
+        $dllPath = "$env:SystemRoot\\System32\\WindowsPowerShell\\v1.0\\$dll"
+        $fileName = [System.IO.Path]::GetFileNameWithoutExtension($dll)
+
+        $gacPath = "$env:windir\\Microsoft.NET\\assembly"
+        $existsInGAC = Get-ChildItem -Recurse -Path $gacPath -Filter "$fileName.dll" -ErrorAction SilentlyContinue | Where-Object {
+            $_.FullName -match [regex]::Escape($fileName)
+        }
+
+        if (-not $existsInGAC) {
+            Write-Host "$dll not found in GAC. Installing..."
+            $publish.GacInstall($dllPath)
+        }
+    }
+
+    # Get the apps
+    $appPackages = Get-AppxPackage -AllUsers
+    $uwpAppList = @()
+
+    # Process only the installed apps
+    foreach ($pkg in $appPackages) {
+        if ($pkg.PackageUserInformation | Where-Object { $_.InstallState -eq 'Installed' }) {
+            $publisher = $null
+            try {
+                $manifest = Get-AppxPackageManifest -Package $pkg.PackageFullName
+                $publisher = $manifest.Package.Properties.PublisherDisplayName
+            } catch {}
+
+            $uwpApp = New-Object -TypeName PSObject
+            $uwpApp | Add-Member -MemberType NoteProperty -Name "DisplayName" -Value $pkg.Name -Force
+            $uwpApp | Add-Member -MemberType NoteProperty -Name "DisplayVersion" -Value $pkg.Version.ToString() -Force
+            $uwpApp | Add-Member -MemberType NoteProperty -Name "Publisher" -Value $publisher -Force
+            $uwpApp | Add-Member -MemberType NoteProperty -Name "AppType" -Value "UWP" -Force
+            $uwpAppList += $uwpApp
+        }
+    }
+
+    $dedupedUwpApps = $uwpAppList | Sort-Object DisplayName, DisplayVersion -Unique
+    return $dedupedUwpApps
+}
+
+
+# Function to get Office update infomation
 function Get-Microsoft365 {
     $IsC2R = Test-Path 'HKLM:\SOFTWARE\Microsoft\Office\ClickToRun'
     if (-not $IsC2R) { Write-Output "Not Click-to-Run Office"; return $null }
@@ -883,10 +939,8 @@ if ($CollectDeviceInventory) {
 # region APPINVENTORY
 if ($CollectAppInventory) {
     Write-Output "Collect App Inventory"
-    #Set Name of Log
     $AppLog = "PowerStacksAppInventory"
 
-    # Get SID of current interactive users
     $CurrentLoggedOnUser = (Get-WmiObject -Class win32_computersystem).UserName
     if ($CurrentLoggedOnUser -eq $null) {
         $CurrentOwner = Get-CimInstance Win32_Process -Filter 'name = "explorer.exe"' | Invoke-CimMethod -MethodName getowner
@@ -896,22 +950,65 @@ if ($CollectAppInventory) {
     $strSID = $AdObj.Translate([System.Security.Principal.SecurityIdentifier])
     $UserSid = $strSID.Value
 
-    # Get Apps for system and current user
     $MyApps = Get-InstalledApplications -UserSid $UserSid
+    $MyApps | ForEach-Object { $_ | Add-Member -NotePropertyName AppType -NotePropertyValue 'Win32' -Force }
+
+    $MyAppsAppx = Get-AppxInstalledApplications # Due to limitations of Get-AppxPackage on AADJ devices we don't use the SID
+    $MyApps += $MyAppsAppx
+
     $UniqueApps = ($MyApps | Group-Object Displayname | Where-Object { $_.Count -eq 1 } ).Group
     $DuplicatedApps = ($MyApps | Group-Object Displayname | Where-Object { $_.Count -gt 1 } ).Group
-    $NewestDuplicateApp = ($DuplicatedApps | Group-Object DisplayName) | ForEach-Object { $_.Group | Sort-Object [version]DisplayVersion -Descending | Select-Object -First 1 }
+    $NewestDuplicateApp = ($DuplicatedApps | Group-Object DisplayName) | ForEach-Object { $_.Group | Sort-Object { [version]$_.DisplayVersion } -Descending | Select-Object -First 1 }
     $CleanAppList = $UniqueApps + $NewestDuplicateApp | Sort-Object DisplayName
-
+    Write-Output 'Clean app list:'
+    Write-Output $CleanAppList
+    
     $AppArray = @()
     foreach ($App in $CleanAppList) {
         $tempapp = New-Object -TypeName PSObject
-        $tempapp | Add-Member -MemberType NoteProperty -Name "AppName" -Value $App.DisplayName -Force
-        $tempapp | Add-Member -MemberType NoteProperty -Name "AppVersion" -Value $App.DisplayVersion -Force
-        $tempapp | Add-Member -MemberType NoteProperty -Name "AppInstallDate" -Value $App.InstallDate -Force -ErrorAction SilentlyContinue
-        $tempapp | Add-Member -MemberType NoteProperty -Name "AppPublisher" -Value $App.Publisher -Force
-        $tempapp | Add-Member -MemberType NoteProperty -Name "AppUninstallString" -Value $App.UninstallString -Force
-        $tempapp | Add-Member -MemberType NoteProperty -Name "AppUninstallRegPath" -Value $app.PSPath.Split("::")[-1]
+
+        if ($null -ne $App.DisplayName) {
+            $tempapp | Add-Member -MemberType NoteProperty -Name "AppName" -Value $App.DisplayName -Force
+        } else {
+            $tempapp | Add-Member -MemberType NoteProperty -Name "AppName" -Value "" -Force
+        }
+
+        if ($null -ne $App.DisplayVersion) {
+            $tempapp | Add-Member -MemberType NoteProperty -Name "AppVersion" -Value $App.DisplayVersion -Force
+        } else {
+            $tempapp | Add-Member -MemberType NoteProperty -Name "AppVersion" -Value "" -Force
+        }
+
+        if ($null -ne $App.Publisher) {
+            $tempapp | Add-Member -MemberType NoteProperty -Name "AppPublisher" -Value $App.Publisher -Force
+        } else {
+            $tempapp | Add-Member -MemberType NoteProperty -Name "AppPublisher" -Value "" -Force
+        }
+
+        if ($null -ne $App.AppType) {
+            $tempapp | Add-Member -MemberType NoteProperty -Name "AppType" -Value $App.AppType -Force
+        } else {
+            $tempapp | Add-Member -MemberType NoteProperty -Name "AppType" -Value "Unknown" -Force
+        }
+
+        if ($App.PSObject.Properties.Name -contains "InstallDate" -and $App.InstallDate) {
+            $tempapp | Add-Member -MemberType NoteProperty -Name "AppInstallDate" -Value $App.InstallDate -Force
+        } else {
+            $tempapp | Add-Member -MemberType NoteProperty -Name "AppInstallDate" -Value $null -Force
+        }
+
+        if ($App.PSObject.Properties.Name -contains "UninstallString" -and $App.UninstallString) {
+            $tempapp | Add-Member -MemberType NoteProperty -Name "AppUninstallString" -Value $App.UninstallString -Force
+        } else {
+            $tempapp | Add-Member -MemberType NoteProperty -Name "AppUninstallString" -Value $null -Force
+        }
+
+        if ($App.PSObject.Properties.Name -contains "PSPath" -and $App.PSPath) {
+            $tempapp | Add-Member -MemberType NoteProperty -Name "AppUninstallRegPath" -Value $App.PSPath.Split("::")[-1] -Force
+        } else {
+            $tempapp | Add-Member -MemberType NoteProperty -Name "AppUninstallRegPath" -Value $null -Force
+        }
+
         $AppArray += $tempapp
     }
 
@@ -921,7 +1018,7 @@ if ($CollectAppInventory) {
     $cs = New-Object System.IO.Compression.GZipStream($ms, [System.IO.Compression.CompressionMode]::Compress)
     $sw = New-Object System.IO.StreamWriter($cs)
     $sw.Write($InstalledAppJson)
-    $sw.Close();
+    $sw.Close()
     $InstalledAppJson = [System.Convert]::ToBase64String($ms.ToArray())
 
     $MainApp = New-Object -TypeName PSObject
@@ -929,27 +1026,24 @@ if ($CollectAppInventory) {
     $MainApp | Add-Member -MemberType NoteProperty -Name "ManagedDeviceID" -Value "$ManagedDeviceID" -Force
 
     $InstalledAppJsonArr = $InstalledAppJson -split '(.{31744})'
-
     $i = 0
-
     foreach ($InstalledApp in $InstalledAppJsonArr) {
-
         if ($InstalledApp.Length -gt 0 ) {
             $i++
             $MainApp | Add-Member -MemberType NoteProperty -Name ("InstalledApps" + $i.ToString()) -Value $InstalledApp -Force
         }
-
     }
+
     if ($InstalledAppJson.Length -gt (10 * 31 * 1024)) {
         throw("InstallApp is too big and exceed the 32kb limit per column for a single upload. Please increase number of columns (#10). Current payload size is: " + ($InstalledAppJson.Length / 1024).ToString("#.#") + "kb")
     }
 
-    $AppJson = $MainApp | ConvertTo-Json
-
-    # Submit the data to the API endpoint
+    $AppJson = $MainApp | ConvertTo-Json   
     $ResponseAppInventory = Send-LogAnalyticsData -customerId $customerId -sharedKey $sharedKey -body ([System.Text.Encoding]::UTF8.GetBytes($AppJson)) -logType $AppLog
 }
 # end region APPINVENTORY
+
+
 
 # region DRIVERINVENTORY
 if ($CollectDriverInventory) {
