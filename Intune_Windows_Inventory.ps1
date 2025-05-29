@@ -23,7 +23,7 @@ $WarrantyDellClientSecret = "EnterYourDellClientSecret"
 $WarrantyLenovoClientID = "EnterYourLenovoClientID"
 
 # You can use an optional field to specify the timestamp from the data. If the time field is not specified, Azure Monitor assumes the time is the message ingestion time
-# DO NOT DELETE THIS VARIABLE. Recommened keep this blank.
+# DO NOT DELETE THIS VARIABLE. Recommended keep this blank.
 $TimeStampField = ""
 
 #Control if you want to remove BuiltIn Monitors (true = Remove)
