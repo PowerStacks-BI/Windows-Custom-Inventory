@@ -1,26 +1,128 @@
+<#
+.SYNOPSIS
+    Comprehensive inventory and warranty collection script for Intune-managed Windows 10/11 devices.
+    Gathers hardware, software, driver, monitor, disk, battery, Microsoft 365, and warranty data, 
+    then uploads results to Azure Log Analytics for centralized reporting.
+
+.DESCRIPTION
+    This script is designed for deployment via Intune to Windows 10/11 endpoints. It collects detailed inventory data including:
+      - Hardware specs (CPU, RAM, disks, chassis)
+      - Battery health
+      - Monitor (LCD) information including serial numbers and date of manufacture
+      - Installed Win32 and UWP applications
+      - Installed and available drivers
+      - Microsoft 365 update channel and compliance
+      - Device warranty status for Dell, HP, Lenovo, and Getac (via vendor APIs)
+    Warranty lookups are cached locally to minimize API calls and can be forced to refresh as needed. 
+    All collected data is compressed, base64-encoded, and securely uploaded to Azure Log Analytics.
+    The script is modular, allowing granular control over which inventory types are collected via variables.
+
+.APIKEYS
+    To enable warranty lookups, you must obtain API credentials from each vendor:
+      - Dell: Register for a Dell TechDirect account (https://techdirect.dell.com/), request API access, and generate a Client ID and Secret for the Warranty API.
+      - Lenovo: Request access to the Lenovo Warranty API at https://supportapi.lenovo.com or through your Lenovo rep. You will receive a Client ID for authentication.
+      - HP: Apply for HP’s Warranty API access at https://developer.hp.com/ or through your HP rep. After approval, create an application to obtain a Client ID and Secret.
+      - Getac: Contact Getac support or your Getac account representative to request API access and credentials for warranty lookups.
+
+
+.PARAMETER WarrantyMaxCacheAgeDays
+    [int] Maximum number of days before cached warranty data is considered stale. Default: 180.
+
+.PARAMETER WarrantyForceRefresh
+    [switch] When set to $true, ignores cached warranty data and forces a fresh API lookup.
+
+.PARAMETER $CollectDeviceInventory
+    [bool] Set to $true to collect device hardware inventory. Default: $true.
+
+.PARAMETER $CollectAppInventory
+    [bool] Set to $true to collect installed application inventory. Default: $true.
+
+.PARAMETER $CollectDriverInventory
+    [bool] Set to $true to collect installed and available driver inventory. Default: $true.
+
+.PARAMETER $CollectUWPInventory
+    [bool] Set to $true to collect UWP (AppX) application inventory. Default: $false.
+
+.PARAMETER $CollectMicrosoft365
+    [bool] Set to $true to collect Microsoft 365 update and compliance data. Default: $true.
+
+.PARAMETER $CollectWarranty
+    [bool] Set to $true to collect device warranty information. Default: $false.
+
+.PARAMETER $RemoveBuiltInMonitors
+    [bool] Set to $true to exclude built-in monitors from monitor inventory. Default: $false.
+
+.PARAMETER $InventoryDateFormat
+    [string] Date format string for inventory timestamps. Default: "MM-dd HH:mm".
+
+.PARAMETER $CustomerId
+    [string] Azure Log Analytics Workspace ID.
+
+.PARAMETER $SharedKey
+    [string] Azure Log Analytics Primary Key.
+
+.PARAMETER $WarrantyDellClientID, $WarrantyDellClientSecret
+    [string] Dell API credentials for warranty lookup.
+
+.PARAMETER $WarrantyLenovoClientID
+    [string] Lenovo API credential for warranty lookup.
+
+.PARAMETER $WarrantyHPClientID, $WarrantyHPClientSecret
+    [string] HP API credentials for warranty lookup.
+
+.PARAMETER $TimeStampField
+    [string] Optional. Specifies the timestamp field for Log Analytics ingestion. Leave blank unless required.
+
+.NOTES
+    Author: John Marcum (PJM)
+    Date: June 9, 2025
+    Contact: https://x.com/MEM_MVP
+
+.VERSION HISTORY
+12 - June 9, 2025
+- Added HP warranty support and warranty caching
+- Changed warranty date fields to datetime
+- Added $CollectUWPInventory toggle
+- Fixed driver inventory bug with Get-Package provider
+- Added OS install date
+
+########### LEGAL DISCLAIMER ###########
+    This script is provided "as is" without warranty of any kind, either express or implied. 
+    Use at your own risk. Test thoroughly before deploying in production environments.
+#>
+
+
 #region initialize
 # Enable TLS 1.2 support
 [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
 
 # Replace with your Log Analytics Workspace ID
-$CustomerId = "<EnterYourLogAnalyticsWorkspaceID>"   
+$CustomerId = "<Enter Your Log Analytics Workspace ID>"   
 
 # Replace with your Primary Key
-$SharedKey = "<EnterYourLogAnalyicsPrimaryKey>"
+$SharedKey = "<Enter Your Log Analytics Workspace Primary Key>"
 
-#Control if you want to collect Device, App, and Driver Inventory or both (True = Collect)
+#Control if you want to collect Device, Win32 App, UWP App, and Driver Inventory. (True = Collect)
 $CollectDeviceInventory = $true
 $CollectAppInventory = $true
 $CollectDriverInventory = $true
+$CollectUWPInventory = $False # Set to true to collect UWP (modern app) inventory.
 
 #Sub-Control under Device Inventory
 $CollectMicrosoft365 = $true
-$CollectWarranty = $false # Keep false for standard inventory. Change to $true or once per month warranty data.
+$CollectWarranty = $true # Set to true to collect warranty data
 
 #Warranty keys
-$WarrantyDellClientID = "<EnterYourDellClientID>"
-$WarrantyDellClientSecret = "EnterYourDellClientSecret"
-$WarrantyLenovoClientID = "EnterYourLenovoClientID"
+$WarrantyDellClientID = "<Enter Your Dell Client ID>"
+$WarrantyDellClientSecret = "<Enter Your Dell Client Secret>"
+$WarrantyLenovoClientID = "<Enter Your Lenovo Client ID>"
+$WarrantyHPClientID = "<Enter Your HP Client ID>"
+$WarrantyHPClientSecret = "<Enter Your HP Client Secret>"  # Make note of expiration date!
+
+
+# Warranty cache settings
+[int]$WarrantyMaxCacheAgeDays = 180 # The max age of the .json file which caches warranty data. 
+[switch]$WarrantyForceRefresh = $false # Set to true to ignore the json and pull data from the API.
 
 # You can use an optional field to specify the timestamp from the data. If the time field is not specified, Azure Monitor assumes the time is the message ingestion time
 # DO NOT DELETE THIS VARIABLE. Recommended keep this blank.
@@ -40,11 +142,20 @@ $logPath = "C:\Windows\Logs\Intune_Inventory_$Now.log"
 Start-Transcript -Path $logPath -Append
 
 
-
 #region functions
 
 # Function to get all Installed Application
 function Get-InstalledApplications() {
+    <#
+.SYNOPSIS
+    Retrieves installed Win32 applications for a specified user.
+.DESCRIPTION
+    Scans registry locations for installed Win32 applications, including 32-bit and 64-bit entries, and returns details such as name, version, publisher, and install date.
+.PARAMETER UserSid
+    The SID of the user whose HKU registry hive should be scanned for per-user applications.
+.OUTPUTS
+    PSCustomObject[] representing installed applications.
+#>
     param(
         [string]$UserSid
     )
@@ -83,7 +194,18 @@ function Get-InstalledApplications() {
 
 # Function to get deduplicated Appx Installed Applications (UWP)
 Function Get-AppxInstalledApplications() {
+    <#
+.SYNOPSIS
+    Retrieves deduplicated list of installed UWP (AppX) applications for all users.
+.DESCRIPTION
+    Handles known issues with Get-AppxPackage on Windows 11 24H2, loads required assemblies, and returns UWP app details including name, version, and publisher.
+.OUTPUTS
+    PSCustomObject[] representing installed UWP applications.
+#>    
+    
     # Fix for issue which breaks Get-AppxPackage in Win11 24H2
+    # This is a known bug in 24H2. 
+    # Remove the fix once MS fixes the issue. Until this UWP app inventory may or may not work in 24H2
     Add-Type -AssemblyName "System.EnterpriseServices"
     $publish = [System.EnterpriseServices.Internal.Publish]::new()
 
@@ -108,9 +230,22 @@ Function Get-AppxInstalledApplications() {
             $publish.GacInstall($dllPath)
         }
     }
+    # End the fix
+
 
     # Get the apps
-    $appPackages = Get-AppxPackage -AllUsers
+    try {
+        $ErrorActionPreference = 'Stop'
+        $appPackages = Get-AppxPackage -AllUsers
+    }
+    catch {
+        Write-Warning "Failed to retrieve Appx packages: $($_.Exception.Message)"
+        $appPackages = @() # or $null if you prefer
+    }
+    finally {
+        $ErrorActionPreference = 'Continue' # Reset to default if needed
+    }
+
     $uwpAppList = @()
 
     # Process only the installed apps
@@ -120,7 +255,8 @@ Function Get-AppxInstalledApplications() {
             try {
                 $manifest = Get-AppxPackageManifest -Package $pkg.PackageFullName
                 $publisher = $manifest.Package.Properties.PublisherDisplayName
-            } catch {}
+            }
+            catch {}
 
             $uwpApp = New-Object -TypeName PSObject
             $uwpApp | Add-Member -MemberType NoteProperty -Name "DisplayName" -Value $pkg.Name -Force
@@ -136,8 +272,17 @@ Function Get-AppxInstalledApplications() {
 }
 
 
+
 # Function to get Office update infomation
 function Get-Microsoft365 {
+    <#
+.SYNOPSIS
+    Retrieves Microsoft 365 (Office Click-to-Run) update and compliance information.
+.DESCRIPTION
+    Determines installed Office version, update channel, latest release, end of support, and other compliance details by querying registry and Microsoft APIs.
+.OUTPUTS
+    PSCustomObject with Office version, channel, release, and support information.
+#>
     $IsC2R = Test-Path 'HKLM:\SOFTWARE\Microsoft\Office\ClickToRun'
     if (-not $IsC2R) { Write-Output "Not Click-to-Run Office"; return $null }
 
@@ -325,26 +470,33 @@ function Get-Microsoft365 {
     }
 }
 
-
 # Function to get Installed Drivers
 <#
-Feel free to edit the query user to collect drivers.
+Feel free to edit the query collect more or less drivers. - PJM
 #>
 function Get-InstalledDrivers() {
+    <#
+.SYNOPSIS
+    Retrieves installed and available driver information.
+.DESCRIPTION
+    Collects installed drivers from Win32_PnPSignedDriver and available driver updates from Windows Update, returning a unified list of driver details.
+.OUTPUTS
+    PSCustomObject[] representing installed and available drivers.
+#>
     Write-Output "Begin getting installed drivers"
     # Get PnP signed drivers
     Write-Output "Get PnP signed drivers"
     $PNPSigned_Drivers = Get-CimInstance -ClassName Win32_PnPSignedDriver | Where-Object {
-        ($_.Manufacturer -ne "Microsoft") -and 
-        ($_.DriverProviderName -ne "Microsoft") -and 
-        ($_.DeviceName -ne $null)
+    ($_.Manufacturer -ne "Microsoft") -and 
+    ($_.DriverProviderName -ne "Microsoft") -and 
+    ($_.DeviceName -ne $null)
     } | Select-Object DeviceName, DriverVersion, DriverDate, DeviceClass, DeviceID, HardwareID, Manufacturer, InfName, Location, Description, DriverProviderName
     $PNPSigned_Drivers
 
-    # Get installed MSU packages
-    Write-Output "Get installed MSU packages"
-    $InstalledDrivers = Get-Package -ProviderName msu | Where-Object {
-        $_.Metadata.Item("SupportUrl") -match "target=hub"
+    # Simulate installed driver packages based on PnP data
+    Write-Output "Get installed drivers from PnP data"
+    $InstalledDrivers = $PNPSigned_Drivers | Where-Object {
+        $_.DriverProviderName -notlike "*Microsoft*" -and $_.DeviceName
     }
     $InstalledDrivers
 
@@ -354,7 +506,9 @@ function Get-InstalledDrivers() {
     $updateSearcher = $updateSession.CreateUpdateSearcher()
     $searchResult = $updateSearcher.Search("IsInstalled=0 AND Type='Driver'")
     $OptionalWUList = @()
-    $searchResult.Updates.Count
+
+    Write-Output "Optional update count: $($searchResult.Updates.Count)"
+
     If ($searchResult.Updates.Count -gt 0) {
         For ($i = 0; $i -lt $searchResult.Updates.Count; $i++) {
             $update = $searchResult.Updates.Item($i)
@@ -362,8 +516,18 @@ function Get-InstalledDrivers() {
                 WUName             = $update.Title
                 DriverName         = $update.DriverModel
                 DriverVersion      = $null
-                DriverReleaseDate  = $update.DriverVerDate.ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ss.fffffffZ")
-                DriverClass        = $update.DriverClass.ToUpper()
+                DriverReleaseDate  = if ($update.DriverVerDate) { 
+                    $update.DriverVerDate.ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ss.fffffffZ") 
+                }
+                else { 
+                    $null 
+                }
+                DriverClass        = if ($update.DriverClass) { 
+                    $update.DriverClass.ToUpper() 
+                }
+                else { 
+                    $null 
+                }
                 DriverID           = $null
                 DriverHardwareID   = $update.DriverHardwareID
                 DriverManufacturer = $update.DriverManufacturer
@@ -371,7 +535,12 @@ function Get-InstalledDrivers() {
                 DriverLocation     = $null
                 DriverDescription  = $update.Description
                 DriverProvider     = $update.DriverProvider
-                DriverPublishedOn  = $update.LastDeploymentChangeTime.ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ss.fffffffZ")
+                DriverPublishedOn  = if ($update.LastDeploymentChangeTime) {
+                    $update.LastDeploymentChangeTime.ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ss.fffffffZ")
+                }
+                else {
+                    $null
+                }
                 DriverStatus       = "Optional"
             }
         }
@@ -379,19 +548,22 @@ function Get-InstalledDrivers() {
 
     # Link installed drivers
     $LinkedDrivers = foreach ($installedDriver in $InstalledDrivers) {
-        Write-Output "Attempting to link driver: $installedDriver"
-        $versionFromName = $installedDriver.Name.Split()[-1]
-        Write-Output "Driver version from name: $versionFromName"
+        $versionFromName = $installedDriver.DriverVersion
         $matchingDriver = $PNPSigned_Drivers | Where-Object {
             $_.DriverVersion -eq $versionFromName
         } | Select-Object -First 1
 
         if ($matchingDriver) {
             [PSCustomObject]@{
-                WUName             = $installedDriver.Name
+                WUName             = $null
                 DriverName         = $matchingDriver.DeviceName
                 DriverVersion      = $matchingDriver.DriverVersion
-                DriverReleaseDate  = $matchingDriver.DriverDate.ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ss.fffffffZ")
+                DriverReleaseDate  = if ($matchingDriver.DriverDate) {
+                    $matchingDriver.DriverDate.ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ss.fffffffZ")
+                }
+                else {
+                    $null
+                }
                 DriverClass        = $matchingDriver.DeviceClass
                 DriverID           = $matchingDriver.DeviceID
                 DriverHardwareID   = $matchingDriver.HardwareID
@@ -408,21 +580,13 @@ function Get-InstalledDrivers() {
 
     # Add unmatched installed drivers
     $matchedVersions = $LinkedDrivers | Where-Object { $_.DriverVersion } | Select-Object -ExpandProperty DriverVersion
-    $matchedVersions
-    start-sleep 10
+    Start-Sleep -Seconds 1
     $unmatchedDrivers = $PNPSigned_Drivers | Where-Object { $matchedVersions -notcontains $_.DriverVersion }
-    $unmatchedDrivers
 
-    # Combine both sets of drivers using the same foreach pattern
+    # Combine all drivers
     $LinkedDrivers = @(
         $LinkedDrivers
-        $LinkedDrivers  # Include existing linked drivers
         foreach ($driver in $unmatchedDrivers) {
-
-            $driver.DeviceName
-            $driver.DriverVersion
-            # $driver.DriverDate.ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ss.fffffffZ")
-            $driver.DeviceClass 
             [PSCustomObject]@{
                 WUName             = $null
                 DriverName         = $driver.DeviceName
@@ -444,10 +608,8 @@ function Get-InstalledDrivers() {
                 DriverPublishedOn  = $null
                 DriverStatus       = "Installed"
             }
-
         }
     )
-
 
     # Add optional updates to the list
     foreach ($optionalDriver in $OptionalWUList) {
@@ -455,52 +617,92 @@ function Get-InstalledDrivers() {
             WUName             = $optionalDriver.WUName
             DriverName         = $optionalDriver.DriverName
             DriverVersion      = $optionalDriver.DriverVersion
-            DriverReleaseDate  = $optionalDriver.DriverDate
-            DriverClass        = $optionalDriver.DeviceClass
-            DriverID           = $optionalDriver.DeviceID
+            DriverReleaseDate  = $optionalDriver.DriverReleaseDate
+            DriverClass        = $optionalDriver.DriverClass
+            DriverID           = $optionalDriver.DriverID
             DriverHardwareID   = $optionalDriver.DriverHardwareID
-            DriverManufacturer = $optionalDriver.Manufacturer
-            DriverInfName      = $optionalDriver.InfName
-            DriverLocation     = $optionalDriver.Location
-            DriverDescription  = $optionalDriver.Description
+            DriverManufacturer = $optionalDriver.DriverManufacturer
+            DriverInfName      = $optionalDriver.DriverInfName
+            DriverLocation     = $optionalDriver.DriverLocation
+            DriverDescription  = $optionalDriver.DriverDescription
             DriverProvider     = $optionalDriver.DriverProvider
-            DriverPublishedOn  = $optionalDriver.DriverChangeTime
+            DriverPublishedOn  = $optionalDriver.DriverPublishedOn
             DriverStatus       = $optionalDriver.DriverStatus
         }
     }
 
     Return $LinkedDrivers
+
 }
 
 # Function to get Dell Warranty
-function Get-DellWarranty([Parameter(Mandatory = $true)]$SourceDevice) {
+function Get-DellWarranty(
+    <#
+.SYNOPSIS
+    Retrieves Dell warranty information using the Dell Warranty API.
+.DESCRIPTION
+    Authenticates with Dell’s API using provided credentials, retrieves warranty details for the specified device, and returns warranty information as a custom object.
+.PARAMETER SourceDevice
+    The Dell service tag (serial number) of the device.
+.OUTPUTS
+    PSCustomObject with Dell warranty details.
+#>    
+    [Parameter(Mandatory = $true)]$SourceDevice) {
     $AuthURI = "https://apigtwb2c.us.dell.com/auth/oauth/v2/token"
-    if ($Global:TokenAge -lt (get-date).AddMinutes(-55)) { $global:Token = $null }
-    If ($null -eq $global:Token) {
-        $OAuth = "$WarrantyDellClientID`:$WarrantyDellClientSecret"
-        $Bytes = [System.Text.Encoding]::ASCII.GetBytes($OAuth)
-        $EncodedOAuth = [Convert]::ToBase64String($Bytes)
-        $headersAuth = @{ "authorization" = "Basic $EncodedOAuth" }
-        $Authbody = 'grant_type=client_credentials'
-        $AuthResult = Invoke-RESTMethod -Method Post -Uri $AuthURI -Body $AuthBody -Headers $HeadersAuth
-        $global:token = $AuthResult.access_token
-        $Global:TokenAge = (get-date)
-    }
- 
-    $headersReq = @{ "Authorization" = "Bearer $global:Token" }
-    $ReqBody = @{ servicetags = $SourceDevice }
-    $WarReq = Invoke-RestMethod -Uri "https://apigtwb2c.us.dell.com/PROD/sbil/eapi/v5/asset-entitlements" -Headers $headersReq -Body $ReqBody -Method Get -ContentType "application/json"
-    if ($warreq.entitlements.serviceleveldescription) {
-        $WarObj = [PSCustomObject]@{
-            'ServiceProvider'         = 'Dell'
-            'ServiceModel'            = $warreq.productLineDescription
-            'ServiceTag'              = $SourceDevice
-            'ServiceLevelDescription' = $warreq.entitlements.serviceleveldescription -join "`n"
-            'WarrantyStartDate'       = ($warreq.entitlements.startdate | sort-object -Descending | select-object -last 1)
-            'WarrantyEndDate'         = ($warreq.entitlements.enddate | sort-object | select-object -last 1)
+
+    try {
+        Write-Output "[$SourceDevice] Checking Dell OAuth token validity..."
+        if ($Global:TokenAge -lt (Get-Date).AddMinutes(-55)) {
+            Write-Output "[$SourceDevice] Token expired or missing. Clearing existing token..."
+            $global:Token = $null
+        }
+
+        if ($null -eq $global:Token) {
+            Write-Output "[$SourceDevice] Requesting new Dell OAuth token..."
+            $OAuth = "$WarrantyDellClientID`:$WarrantyDellClientSecret"
+            $Bytes = [System.Text.Encoding]::ASCII.GetBytes($OAuth)
+            $EncodedOAuth = [Convert]::ToBase64String($Bytes)
+            $headersAuth = @{ "authorization" = "Basic $EncodedOAuth" }
+            $Authbody = 'grant_type=client_credentials'
+
+            $AuthResult = Invoke-RESTMethod -Method Post -Uri $AuthURI -Body $AuthBody -Headers $HeadersAuth
+            $global:token = $AuthResult.access_token
+            $Global:TokenAge = Get-Date
+            Write-Output "[$SourceDevice] Dell token acquired successfully."
+        }
+
+        Write-Output "[$SourceDevice] Submitting Dell warranty request..."
+        $headersReq = @{ "Authorization" = "Bearer $global:Token" }
+        $ReqBody = @{ servicetags = $SourceDevice }
+
+        $WarReq = Invoke-RestMethod -Uri "https://apigtwb2c.us.dell.com/PROD/sbil/eapi/v5/asset-entitlements" -Headers $headersReq -Body $ReqBody -Method Get -ContentType "application/json"
+
+        if ($WarReq.entitlements.serviceleveldescription) {
+            Write-Output "[$SourceDevice] Warranty data received from Dell."
+
+            $WarObj = [PSCustomObject]@{
+                'ServiceProvider'         = 'Dell'
+                'ServiceModel'            = $WarReq.productLineDescription
+                'ServiceTag'              = $SourceDevice
+                'ServiceLevelDescription' = $WarReq.entitlements.serviceleveldescription -join "`n"
+                'WarrantyStartDate'       = ($WarReq.entitlements.startdate | Sort-Object -Descending | Select-Object -Last 1)
+                'WarrantyEndDate'         = ($WarReq.entitlements.enddate | Sort-Object | Select-Object -Last 1)
+            }
+        }
+        else {
+            Write-Output "[$SourceDevice] No service level description returned by Dell."
+            $WarObj = [PSCustomObject]@{
+                'ServiceProvider'         = 'Dell'
+                'ServiceModel'            = $null
+                'ServiceTag'              = $SourceDevice
+                'ServiceLevelDescription' = 'Could not get warranty information'
+                'WarrantyStartDate'       = $null
+                'WarrantyEndDate'         = $null
+            }
         }
     }
-    else {
+    catch {
+        Write-Output "[$SourceDevice] ERROR during Dell warranty lookup: $($_.Exception.Message)"
         $WarObj = [PSCustomObject]@{
             'ServiceProvider'         = 'Dell'
             'ServiceModel'            = $null
@@ -510,11 +712,25 @@ function Get-DellWarranty([Parameter(Mandatory = $true)]$SourceDevice) {
             'WarrantyEndDate'         = $null
         }
     }
+
     return $WarObj
 }
 
+
+
 # Function to get Lenovo Warranty
-function Get-LenovoWarranty([Parameter(Mandatory = $true)]$SourceDevice) {
+function Get-LenovoWarranty(
+    <#
+.SYNOPSIS
+    Retrieves Lenovo warranty information using the Lenovo Warranty API.
+.DESCRIPTION
+    Queries Lenovo’s API using the provided client ID and device serial number, returning warranty details as a custom object.
+.PARAMETER SourceDevice
+    The Lenovo serial number of the device.
+.OUTPUTS
+    PSCustomObject with Lenovo warranty details.
+#>    
+    [Parameter(Mandatory = $true)]$SourceDevice) {
     $headersReq = @{ "ClientID" = $WarrantyLenovoClientID }
     $WarReq = Invoke-RestMethod -Uri "http://supportapi.lenovo.com/V2.5/Warranty?Serial=$SourceDevice" -Headers $headersReq -Method Get -ContentType "application/json"
     
@@ -544,7 +760,18 @@ function Get-LenovoWarranty([Parameter(Mandatory = $true)]$SourceDevice) {
 }
 
 # Function to get Getac Warranty
-function Get-GetacWarranty([Parameter(Mandatory = $true)]$SourceDevice) {
+function Get-GetacWarranty(
+    <#
+.SYNOPSIS
+    Retrieves Getac warranty information using the Getac API.
+.DESCRIPTION
+    Queries Getac’s API with the device serial number and returns warranty details as a custom object.
+.PARAMETER SourceDevice
+    The Getac serial number of the device.
+.OUTPUTS
+    PSCustomObject with Getac warranty details.
+#>
+    [Parameter(Mandatory = $true)]$SourceDevice) {
     $WarReq = Invoke-RestMethod -Uri https://api.getac.us/rma-manager/rma/verify-serial?serial=$SerialNumber -Method Get -ContentType "application/json"
     try {
         $WarObj = [PSCustomObject]@{
@@ -569,8 +796,206 @@ function Get-GetacWarranty([Parameter(Mandatory = $true)]$SourceDevice) {
     return $WarObj
 }
 
+# Function to get HP Warranty
+function Get-HPWarranty(
+    <#
+.SYNOPSIS
+    Retrieves HP warranty information using the HP Warranty API.
+.DESCRIPTION
+    Authenticates with HP’s API using provided credentials, submits a batch job for the device serial number, and returns warranty details as a custom object.
+.PARAMETER SourceDevice
+    The HP serial number of the device.
+.OUTPUTS
+    PSCustomObject with HP warranty details.
+#>
+    [Parameter(Mandatory = $true)]$SourceDevice) {
+
+    try {
+        Write-Output "[$SourceDevice] Requesting HP warranty token..."
+        $b64EncodedCred = [System.Convert]::ToBase64String([System.Text.Encoding]::ASCII.GetBytes("$WarrantyHPClientID`:$WarrantyHPClientSecret"))
+        $tokenURI = "https://warranty.api.hp.com/oauth/v1/token"
+        $tokenHeaders = @{
+            accept        = "application/json"
+            authorization = "Basic $b64EncodedCred"
+        }
+        $tokenBody = "grant_type=client_credentials"
+
+        $authResponse = Invoke-WebRequest -UseBasicParsing -Method POST -Uri $tokenURI -Headers $tokenHeaders -Body $tokenBody -ContentType "application/x-www-form-urlencoded"
+        $accessToken = ($authResponse | ConvertFrom-Json).access_token
+        Write-Output "[$SourceDevice] Successfully obtained access token."
+
+        Write-Output "[$SourceDevice] Submitting HP batch job..."
+        $queryBody = "[{""sn"":""$SourceDevice""}]"
+        $queryURI = "https://warranty.api.hp.com/productwarranty/v2/jobs"
+        $queryHeaders = @{
+            accept        = "application/json"
+            authorization = "Bearer $accessToken"
+        }
+
+        $jobResponse = Invoke-WebRequest -UseBasicParsing -Method POST -Uri $queryURI -Headers $queryHeaders -Body $queryBody -ContentType "application/json"
+        $jobData = $jobResponse | ConvertFrom-Json
+        $jobId = $jobData.jobId
+        $estimatedTime = $jobData.estimatedTime
+        Write-Output "[$SourceDevice] Batch job created. Job ID: $jobId. Estimated time: $estimatedTime seconds."
+
+        Start-Sleep -Seconds $estimatedTime
+
+        $JobStatusURI = "$queryURI/$jobId"
+        $JobResultsURI = "$queryURI/$jobId/results"
+
+        Write-Output "[$SourceDevice] Polling job status..."
+
+        do {
+            $JobStatus = Invoke-WebRequest -UseBasicParsing -Method GET -Uri $JobStatusURI -Headers $queryHeaders | ConvertFrom-Json
+            Write-Output "[$SourceDevice] Job status: $($JobStatus.status)"
+            if ($JobStatus.status -ne "completed") {
+                Start-Sleep -Seconds 15
+            }
+        } while ($JobStatus.status -ne "completed")
+
+        Write-Output "[$SourceDevice] Job completed. Retrieving results..."
+
+        $result = Invoke-WebRequest -UseBasicParsing -Method GET -Uri $JobResultsURI -Headers $queryHeaders | ConvertFrom-Json
+
+        if (-not $result -or $result.Count -eq 0) {
+            Write-Output "[$SourceDevice] No data returned in results array."
+            throw "Empty results"
+        }
+
+        $deviceData = $result[0]  # root array
+        $product = $deviceData.product
+        $offers = $deviceData.offers
+
+        if ($offers) {
+            Write-Output "[$SourceDevice] Warranty data retrieved successfully."
+
+            $serviceDescriptions = $offers | ForEach-Object {
+                "$($_.offerDescription) ($($_.serviceObligationLineItemStartDate) to $($_.serviceObligationLineItemEndDate))"
+            }
+
+            $startDate = ($offers.serviceObligationLineItemStartDate | Sort-Object -Descending | Select-Object -First 1)
+            $endDate = ($offers.serviceObligationLineItemEndDate | Sort-Object | Select-Object -Last 1)
+
+            $WarObj = [PSCustomObject]@{
+                'ServiceProvider'         = 'HP'
+                'ServiceModel'            = $product.productDescription
+                'ServiceTag'              = $SourceDevice
+                'ServiceLevelDescription' = $serviceDescriptions -join "`n"
+                'WarrantyStartDate'       = $startDate
+                'WarrantyEndDate'         = $endDate
+            }
+        }
+        else {
+            Write-Output "[$SourceDevice] No offers found in response."
+            $WarObj = [PSCustomObject]@{
+                'ServiceProvider'         = 'HP'
+                'ServiceModel'            = $product.productDescription
+                'ServiceTag'              = $SourceDevice
+                'ServiceLevelDescription' = 'No warranty offers returned'
+                'WarrantyStartDate'       = $null
+                'WarrantyEndDate'         = $null
+            }
+        }
+    }
+    catch {
+        Write-Output "[$SourceDevice] ERROR during HP warranty lookup: $($_.Exception.Message)"
+        $WarObj = [PSCustomObject]@{
+            'ServiceProvider'         = 'HP'
+            'ServiceModel'            = $null
+            'ServiceTag'              = $SourceDevice
+            'ServiceLevelDescription' = 'Could not get warranty information'
+            'WarrantyStartDate'       = $null
+            'WarrantyEndDate'         = $null
+        }
+    }
+
+    return $WarObj
+}
+
+
+# Unified Warranty Retriever
+function Get-Warranty {
+    <#
+.SYNOPSIS
+    Retrieves and caches warranty information for a device from the appropriate vendor API.
+.DESCRIPTION
+    Determines manufacturer, checks for cached warranty data, and if necessary, queries the correct API for warranty details. Supports Dell, Lenovo, HP, and Getac.
+.PARAMETER SerialNumber
+    The device serial number.
+.PARAMETER Manufacturer
+    The device manufacturer.
+.OUTPUTS
+    PSCustomObject with warranty details.
+#>
+    param(
+        [Parameter(Mandatory = $true)][string]$SerialNumber,
+        [Parameter(Mandatory = $true)][string]$Manufacturer
+    )
+    $CachePath = "C:\Windows\Warranty_$SerialNumber.json"
+    try {
+        if (-not $WarrantyForceRefresh -and (Test-Path $CachePath)) {
+            $fileAge = (Get-Date) - (Get-Item $CachePath).LastWriteTime
+            if ($fileAge.TotalDays -le $WarrantyMaxCacheAgeDays) {
+                Write-Output "[$SerialNumber] Using cached warranty data from $CachePath"
+                Write-Output "[$SerialNumber] Skipping API call, using saved JSON."
+                $cached = Get-Content $CachePath -Raw | ConvertFrom-Json
+                $cached.WarrantyStartDate = [datetime]$cached.WarrantyStartDate
+                $cached.WarrantyEndDate = [datetime]$cached.WarrantyEndDate
+                return $cached
+            }
+            else {
+                Write-Output "[$SerialNumber] Cache expired ($([math]::Round($fileAge.TotalDays,1)) days old). Refreshing..."
+            }
+        }
+    }
+    catch {
+        Write-Output "[$SerialNumber] Exception during cache read: $($_.Exception.Message)"
+    }
+    $normalizedMake = ($Manufacturer -replace '\s+', ' ').Trim().ToUpper()
+    Write-Output "Entering warranty switch block with: [$normalizedMake]"
+    $WarrantyData = $null
+    switch -Regex ($normalizedMake) {
+        "^DELL" { $WarrantyData = Get-DellWarranty -SourceDevice $SerialNumber; break }
+        "^LENOVO|^IBM" { $WarrantyData = Get-LenovoWarranty -SourceDevice $SerialNumber; break }
+        "^INSYDE" { $WarrantyData = Get-GetacWarranty -SourceDevice $SerialNumber; break }
+        "^HP" { $WarrantyData = Get-HPWarranty -SourceDevice $SerialNumber; break }
+        default { Write-Output "[$SerialNumber] Manufacturer '$Manufacturer' not supported for warranty lookup." }
+    }
+    if ($WarrantyData) {
+        $WarrantyData | ConvertTo-Json -Depth 5 | Out-File -FilePath $CachePath -Encoding UTF8
+        Write-Output "[$SerialNumber] Warranty data cached at $CachePath"
+        return $WarrantyData
+    }
+    return $null
+}
+
+
 # Function to create the authorization signature
-Function New-Signature ($customerId, $sharedKey, $date, $contentLength, $method, $contentType, $resource) {
+Function New-Signature (
+    # Function to create the authorization signature
+    <#
+.SYNOPSIS
+    Creates an authorization signature for Azure Log Analytics API.
+.DESCRIPTION
+    Generates a SharedKey signature for authenticating requests to Azure Log Analytics.
+.PARAMETER customerId
+    The Log Analytics Workspace ID.
+.PARAMETER sharedKey
+    The Log Analytics Primary Key.
+.PARAMETER date
+    The RFC1123 date string.
+.PARAMETER contentLength
+    The length of the request body.
+.PARAMETER method
+    The HTTP method (e.g., POST).
+.PARAMETER contentType
+    The content type (e.g., application/json).
+.PARAMETER resource
+    The API resource path.
+.OUTPUTS
+    String containing the authorization header value.
+#>    
+    $customerId, $sharedKey, $date, $contentLength, $method, $contentType, $resource) {
     $xHeaders = "x-ms-date:" + $date
     $stringToHash = $method + "`n" + $contentLength + "`n" + $contentType + "`n" + $xHeaders + "`n" + $resource
 
@@ -586,7 +1011,24 @@ Function New-Signature ($customerId, $sharedKey, $date, $contentLength, $method,
 }
 
 # Function to create and post the request
-Function Send-LogAnalyticsData($customerId, $sharedKey, $body, $logType) {
+Function Send-LogAnalyticsData(
+    <#
+    .SYNOPSIS
+    Sends data to Azure Log Analytics.
+    .DESCRIPTION
+    Compresses and uploads JSON data to Azure Log Analytics using the provided credentials and log type.
+    .PARAMETER customerId
+    The Log Analytics Workspace ID.
+    .PARAMETER sharedKey
+    The Log Analytics Primary Key.
+    .PARAMETER body
+    The request body (JSON, as bytes).
+    .PARAMETER logType
+    The custom log type name.
+    .OUTPUTS
+    String with the HTTP status code and payload size.
+    #>    
+    $customerId, $sharedKey, $body, $logType) {
     $method = "POST"
     $contentType = "application/json"
     $resource = "/api/logs"
@@ -621,6 +1063,14 @@ Function Send-LogAnalyticsData($customerId, $sharedKey, $body, $logType) {
     return $statusmessage
 }
 function Start-PowerShellSysNative {
+    <#
+.SYNOPSIS
+    Launches a 64-bit PowerShell process from a 32-bit process.
+.DESCRIPTION
+    Ensures that scripts requiring 64-bit PowerShell can be executed from a 32-bit context, passing any specified arguments.
+.PARAMETER Arguments
+    Optional arguments to pass to the new PowerShell process.
+#>
     param (
         [parameter(Mandatory = $false, HelpMessage = "Specify arguments that will be passed to the sysnative PowerShell process.")]
         [ValidateNotNull()]
@@ -686,6 +1136,8 @@ if ($CollectDeviceInventory) {
     $ComputerProcessorMaxClockSpeed = $ComputerCPU.MaxClockSpeed | Get-Unique
     $ComputerNumberOfCores = $ComputerCPU.NumberOfCores | Get-Unique
     $ComputerNumberOfLogicalProcessors = $ComputerCPU.NumberOfLogicalProcessors | Get-Unique
+    $ComputerOSInstallDate = $ComputerInfo.OsInstallDate.ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ss.fffffffZ")
+ 
 
     $BatteryDesignedCapacity = (Get-WmiObject -Class "BatteryStaticData" -Namespace "ROOT\WMI" -ErrorAction SilentlyContinue).DesignedCapacity
     $BatteryFullChargedCapacity = (Get-WmiObject -Class "BatteryFullChargedCapacity" -Namespace "ROOT\WMI" -ErrorAction SilentlyContinue).FullChargedCapacity
@@ -835,38 +1287,24 @@ if ($CollectDeviceInventory) {
     # CollectWarranty
     if ($CollectWarranty) {
         Write-Output "Collect Warranty"
-        # Get Warranty Bios
         $WarrantyBios = Get-WmiObject Win32_Bios
         $WarrantyMake = $WarrantyBios.Manufacturer
         $WarrantySerialNumber = $WarrantyBios.SerialNumber
-
-        if ($WarrantyDellClientID -ne $null -and $WarrantyDellClientSecret -ne $null -and $WarrantyMake -eq "Dell Inc.") {
-            #Write-Output "Dell computer found" -ForegroundColor Green
-            $WarrantyData = Get-DellWarranty -SourceDevice $WarrantySerialNumber
-        } 
-        elseif ($WarrantyLenovoClientID -ne $null -and $WarrantyMake -eq "LENOVO") {
-            #Write-Output "LENOVO computer found" -ForegroundColor Green         
-            $WarrantyData = Get-LenovoWarranty -SourceDevice $WarrantySerialNumber
-        } 
-        elseif ($GetacWarranty -and $WarrantyMake -eq "INSYDE Corp.") {
-            #Write-Output "Getac computer found" -ForegroundColor Green
-            $WarrantyData = Get-GetacWarranty -SourceDevice $WarrantySerialNumber
-        }
-        else {
-            #Write-Output "$Make warranty not supported" -ForegroundColor Red
-            $WarrantyData = $null
-        }
-
-        # Create custom PSObject
-        $Warranty = New-Object -TypeName PSObject
-
+        Write-Output "Warranty Make  : $WarrantyMake"
+        Write-Output "Warranty Serial: $WarrantySerialNumber"
+        $WarrantyData = Get-Warranty -SerialNumber $WarrantySerialNumber -Manufacturer $WarrantyMake
         if ($WarrantyData) {
-            $Warranty | Add-Member -MemberType NoteProperty -Name "ServiceProvider" -Value $WarrantyData.ServiceProvider
-            $Warranty | Add-Member -MemberType NoteProperty -Name "ServiceModel" -Value $WarrantyData.ServiceModel
-            $Warranty | Add-Member -MemberType NoteProperty -Name "ServiceTag" -Value $WarrantyData.ServiceTag
-            $Warranty | Add-Member -MemberType NoteProperty -Name "ServiceLevelDescription" -Value $WarrantyData.ServiceLevelDescription
-            $Warranty | Add-Member -MemberType NoteProperty -Name "WarrantyStartDate" -Value $WarrantyData.WarrantyStartDate
-            $Warranty | Add-Member -MemberType NoteProperty -Name "WarrantyEndDate" -Value $WarrantyData.WarrantyEndDate
+            $Warranty = [PSCustomObject]@{
+                'ServiceProvider'         = $WarrantyData.ServiceProvider
+                'ServiceModel'            = $WarrantyData.ServiceModel
+                'ServiceTag'              = $WarrantyData.ServiceTag
+                'ServiceLevelDescription' = $WarrantyData.ServiceLevelDescription
+                'WarrantyStartDate'       = ([datetime]::Parse($WarrantyData.WarrantyStartDate)).ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ss.fffffffZ")
+                'WarrantyEndDate'         = ([datetime]::Parse($WarrantyData.WarrantyEndDate)).ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ss.fffffffZ")
+            }
+
+            $Warranty | Format-List         
+
         }
     }
 
@@ -887,6 +1325,7 @@ if ($CollectDeviceInventory) {
     $Inventory | Add-Member -MemberType NoteProperty -Name "DeviceManufacturer" -Value "$ComputerManufacturer" -Force
     $Inventory | Add-Member -MemberType NoteProperty -Name "DeviceModel" -Value "$ComputerModel" -Force
     $Inventory | Add-Member -MemberType NoteProperty -Name "Chassis" -Value $ChassisArrayList -Force
+    $Inventory | Add-Member -MemberType NoteProperty -Name "OSInstallDate" -Value "$ComputerOSInstallDate" -Force
     if ($CollectMicrosoft365) {
         $Inventory | Add-Member -MemberType NoteProperty -Name "Microsoft365" -Value $Microsoft365 -Force
     }
@@ -909,10 +1348,31 @@ if ($CollectDeviceInventory) {
     if ($CollectMicrosoft365) {
         $MainDevice | Add-Member -MemberType NoteProperty -Name "Microsoft365" -Value $true -Force
     }
-    if ($CollectWarranty) {
+    if ($CollectWarranty -and $Warranty -and $Warranty.PSObject.Properties.Count -gt 0) {
+        Write-Output "Warranty property count: $($Warranty.PSObject.Properties.Count)"
+        Write-Output "Warranty data contents:`n$($WarrantyData | Out-String)"
+        Write-Output "Warranty contents:`n$($Warranty | Out-String)"
         $MainDevice | Add-Member -MemberType NoteProperty -Name "Warranty" -Value $true -Force
     }
+    else {
+        if (-not $CollectWarranty) {
+            Write-Output "Warranty collection not enabled. Skipping warranty flag."
+        }
+        elseif (-not $Warranty) {
+            Write-Output "Warranty object is null."
+        }
+        elseif ($Warranty.PSObject.Properties.Count -eq 0) {
+            Write-Output "Warranty object is present but has no properties."
+        }
+        else {
+            Write-Output "Warranty check did not meet conditions. Unexpected state."
+        }
 
+        $MainDevice | Add-Member -MemberType NoteProperty -Name "Warranty" -Value $false -Force
+    }
+
+    
+    
     $DeviceDetailsJsonArr = $DeviceDetailsJson -split '(.{31744})'
 
     $i = 0
@@ -953,8 +1413,10 @@ if ($CollectAppInventory) {
     $MyApps = Get-InstalledApplications -UserSid $UserSid
     $MyApps | ForEach-Object { $_ | Add-Member -NotePropertyName AppType -NotePropertyValue 'Win32' -Force }
 
-    $MyAppsAppx = Get-AppxInstalledApplications # Due to limitations of Get-AppxPackage on AADJ devices we don't use the SID
-    $MyApps += $MyAppsAppx
+    if ($CollectUWPInventory) {
+        $MyAppsAppx = Get-AppxInstalledApplications # Due to limitations of Get-AppxPackage on AADJ devices we don't use the SID
+        $MyApps += $MyAppsAppx
+    }
 
     $UniqueApps = ($MyApps | Group-Object Displayname | Where-Object { $_.Count -eq 1 } ).Group
     $DuplicatedApps = ($MyApps | Group-Object Displayname | Where-Object { $_.Count -gt 1 } ).Group
@@ -969,43 +1431,50 @@ if ($CollectAppInventory) {
 
         if ($null -ne $App.DisplayName) {
             $tempapp | Add-Member -MemberType NoteProperty -Name "AppName" -Value $App.DisplayName -Force
-        } else {
+        }
+        else {
             $tempapp | Add-Member -MemberType NoteProperty -Name "AppName" -Value "" -Force
         }
 
         if ($null -ne $App.DisplayVersion) {
             $tempapp | Add-Member -MemberType NoteProperty -Name "AppVersion" -Value $App.DisplayVersion -Force
-        } else {
+        }
+        else {
             $tempapp | Add-Member -MemberType NoteProperty -Name "AppVersion" -Value "" -Force
         }
 
         if ($null -ne $App.Publisher) {
             $tempapp | Add-Member -MemberType NoteProperty -Name "AppPublisher" -Value $App.Publisher -Force
-        } else {
+        }
+        else {
             $tempapp | Add-Member -MemberType NoteProperty -Name "AppPublisher" -Value "" -Force
         }
 
         if ($null -ne $App.AppType) {
             $tempapp | Add-Member -MemberType NoteProperty -Name "AppType" -Value $App.AppType -Force
-        } else {
+        }
+        else {
             $tempapp | Add-Member -MemberType NoteProperty -Name "AppType" -Value "Unknown" -Force
         }
 
         if ($App.PSObject.Properties.Name -contains "InstallDate" -and $App.InstallDate) {
             $tempapp | Add-Member -MemberType NoteProperty -Name "AppInstallDate" -Value $App.InstallDate -Force
-        } else {
+        }
+        else {
             $tempapp | Add-Member -MemberType NoteProperty -Name "AppInstallDate" -Value $null -Force
         }
 
         if ($App.PSObject.Properties.Name -contains "UninstallString" -and $App.UninstallString) {
             $tempapp | Add-Member -MemberType NoteProperty -Name "AppUninstallString" -Value $App.UninstallString -Force
-        } else {
+        }
+        else {
             $tempapp | Add-Member -MemberType NoteProperty -Name "AppUninstallString" -Value $null -Force
         }
 
         if ($App.PSObject.Properties.Name -contains "PSPath" -and $App.PSPath) {
             $tempapp | Add-Member -MemberType NoteProperty -Name "AppUninstallRegPath" -Value $App.PSPath.Split("::")[-1] -Force
-        } else {
+        }
+        else {
             $tempapp | Add-Member -MemberType NoteProperty -Name "AppUninstallRegPath" -Value $null -Force
         }
 
