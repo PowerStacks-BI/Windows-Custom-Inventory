@@ -110,7 +110,7 @@ $CollectUWPInventory = $False # Set to true to collect UWP (modern app) inventor
 
 #Sub-Control under Device Inventory
 $CollectMicrosoft365 = $true
-$CollectWarranty = $true # Set to true to collect warranty data
+$CollectWarranty = $False # Set to true to collect warranty data
 
 #Warranty keys
 $WarrantyDellClientID = "<Enter Your Dell Client ID>"
