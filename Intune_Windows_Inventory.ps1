@@ -1611,7 +1611,7 @@ if ($CollectDriverInventory) {
         $OutputMessage = $OutPutMessage + " DriverInventory: Fail "
     }
 }
-Write-Output $OutputMessage
 
 Stop-Transcript
+Write-Output $OutputMessage
 #endregion script
