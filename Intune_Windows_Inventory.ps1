@@ -79,6 +79,9 @@
     Contact: https://x.com/MEM_MVP
 
 .VERSION HISTORY
+12 - November 5, 2025
+- Fixed bug in driver matching process
+
 12 - June 9, 2025
 - Added HP warranty support and warranty caching
 - Changed warranty date fields to datetime
@@ -114,11 +117,10 @@ $CollectWarranty = $False # Set to true to collect warranty data
 
 #Warranty keys
 $WarrantyDellClientID = "<Enter Your Dell Client ID>"
-$WarrantyDellClientSecret = "<Enter Your Dell Client Secret>"
+$WarrantyDellClientSecret = "<Enter Your Dell Client Secret"
 $WarrantyLenovoClientID = "<Enter Your Lenovo Client ID>"
 $WarrantyHPClientID = "<Enter Your HP Client ID>"
 $WarrantyHPClientSecret = "<Enter Your HP Client Secret>"  # Make note of expiration date!
-
 
 # Warranty cache settings
 [int]$WarrantyMaxCacheAgeDays = 180 # The max age of the .json file which caches warranty data. 
@@ -139,7 +141,7 @@ $InventoryDateFormat = "MM-dd HH:mm"
 # Start Logging
 $Now = Get-Date -Format "yyyy-MM-dd_HHmm"
 $logPath = "C:\Windows\Logs\Intune_Inventory_$Now.log"
-Start-Transcript -Path $logPath -Append
+Start-Transcript -Path $logPath | Out-Null
 
 
 #region functions
@@ -474,139 +476,112 @@ function Get-Microsoft365 {
 <#
 Feel free to edit the query collect more or less drivers. - PJM
 #>
+# Function to get Installed Drivers
 function Get-InstalledDrivers() {
-    <#
-.SYNOPSIS
-    Retrieves installed and available driver information.
-.DESCRIPTION
-    Collects installed drivers from Win32_PnPSignedDriver and available driver updates from Windows Update, returning a unified list of driver details.
-.OUTPUTS
-    PSCustomObject[] representing installed and available drivers.
-#>
-    Write-Output "Begin getting installed drivers"
     # Get PnP signed drivers
-    Write-Output "Get PnP signed drivers"
     $PNPSigned_Drivers = Get-CimInstance -ClassName Win32_PnPSignedDriver | Where-Object {
-    ($_.Manufacturer -ne "Microsoft") -and 
-    ($_.DriverProviderName -ne "Microsoft") -and 
-    ($_.DeviceName -ne $null)
-    } | Select-Object DeviceName, DriverVersion, DriverDate, DeviceClass, DeviceID, HardwareID, Manufacturer, InfName, Location, Description, DriverProviderName
-    $PNPSigned_Drivers
+        ($_.Manufacturer -ne "Microsoft") -and 
+        ($_.DriverProviderName -ne "Microsoft") -and 
+        ($_.DeviceName -ne $null)
+    } | Select-Object DeviceName,DriverVersion,DriverDate,DeviceClass,DeviceID,HardwareID,Manufacturer,InfName,Location,Description,DriverProviderName
 
-    # Simulate installed driver packages based on PnP data
-    Write-Output "Get installed drivers from PnP data"
-    $InstalledDrivers = $PNPSigned_Drivers | Where-Object {
-        $_.DriverProviderName -notlike "*Microsoft*" -and $_.DeviceName
+    # Get installed MSU packages
+    $InstalledDrivers = Get-Package -ProviderName msu | Where-Object {
+        $_.Metadata.Item("SupportUrl") -match "target=hub"
     }
-    $InstalledDrivers
 
     # Get optional updates
-    Write-Output "Get optional updates"
     $updateSession = New-Object -ComObject Microsoft.Update.Session
     $updateSearcher = $updateSession.CreateUpdateSearcher()
     $searchResult = $updateSearcher.Search("IsInstalled=0 AND Type='Driver'")
     $OptionalWUList = @()
-
-    Write-Output "Optional update count: $($searchResult.Updates.Count)"
-
-    If ($searchResult.Updates.Count -gt 0) {
-        For ($i = 0; $i -lt $searchResult.Updates.Count; $i++) {
+    If($searchResult.Updates.Count -gt 0) {
+        For($i = 0; $i -lt $searchResult.Updates.Count; $i++) {
             $update = $searchResult.Updates.Item($i)
             $OptionalWUList += [PSCustomObject]@{
-                WUName             = $update.Title
-                DriverName         = $update.DriverModel
-                DriverVersion      = $null
-                DriverReleaseDate  = if ($update.DriverVerDate) { 
-                    $update.DriverVerDate.ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ss.fffffffZ") 
-                }
-                else { 
-                    $null 
-                }
-                DriverClass        = if ($update.DriverClass) { 
-                    $update.DriverClass.ToUpper() 
-                }
-                else { 
-                    $null 
-                }
-                DriverID           = $null
-                DriverHardwareID   = $update.DriverHardwareID
-                DriverManufacturer = $update.DriverManufacturer
-                DriverInfName      = $null
-                DriverLocation     = $null
-                DriverDescription  = $update.Description
-                DriverProvider     = $update.DriverProvider
-                DriverPublishedOn  = if ($update.LastDeploymentChangeTime) {
-                    $update.LastDeploymentChangeTime.ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ss.fffffffZ")
+                WUName                 = $update.Title
+                DriverName             = $update.DriverModel
+                DriverVersion          = $null
+                DriverReleaseDate      = if ($update.DriverVerDate){
+                $update.DriverVerDate.ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ss.fffffffZ")
                 }
                 else {
                     $null
                 }
-                DriverStatus       = "Optional"
+                DriverClass            = $update.DriverClass.ToUpper()
+                DriverID               = $null
+                DriverHardwareID       = $update.DriverHardwareID
+                DriverManufacturer     = $update.DriverManufacturer
+                DriverInfName          = $null
+                DriverLocation         = $null
+                DriverDescription      = $update.Description
+                DriverProvider         = $update.DriverProvider
+                DriverPublishedOn      = $update.LastDeploymentChangeTime.ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ss.fffffffZ")
+                DriverStatus           = "Optional"
             }
         }
     }
 
     # Link installed drivers
     $LinkedDrivers = foreach ($installedDriver in $InstalledDrivers) {
-        $versionFromName = $installedDriver.DriverVersion
+        $versionFromName = $installedDriver.Name.Split()[-1]
         $matchingDriver = $PNPSigned_Drivers | Where-Object {
             $_.DriverVersion -eq $versionFromName
         } | Select-Object -First 1
 
         if ($matchingDriver) {
             [PSCustomObject]@{
-                WUName             = $null
-                DriverName         = $matchingDriver.DeviceName
-                DriverVersion      = $matchingDriver.DriverVersion
-                DriverReleaseDate  = if ($matchingDriver.DriverDate) {
+                WUName                 = $installedDriver.Name
+                DriverName             = $matchingDriver.DeviceName
+                DriverVersion          = $matchingDriver.DriverVersion             
+                DriverReleaseDate      = if ($matchingDriver.DriverDate){
                     $matchingDriver.DriverDate.ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ss.fffffffZ")
-                }
-                else {
-                    $null
-                }
-                DriverClass        = $matchingDriver.DeviceClass
-                DriverID           = $matchingDriver.DeviceID
-                DriverHardwareID   = $matchingDriver.HardwareID
-                DriverManufacturer = $matchingDriver.Manufacturer
-                DriverInfName      = $matchingDriver.InfName
-                DriverLocation     = $matchingDriver.Location
-                DriverDescription  = $matchingDriver.Description
-                DriverProvider     = $matchingDriver.DriverProviderName
-                DriverPublishedOn  = $null
-                DriverStatus       = "Installed"
+                    }
+                    else {
+                        $null
+                    }
+                DriverClass            = $matchingDriver.DeviceClass
+                DriverID               = $matchingDriver.DeviceID
+                DriverHardwareID       = $matchingDriver.HardwareID
+                DriverManufacturer     = $matchingDriver.Manufacturer
+                DriverInfName          = $matchingDriver.InfName
+                DriverLocation         = $matchingDriver.Location
+                DriverDescription      = $matchingDriver.Description
+                DriverProvider         = $matchingDriver.DriverProviderName
+                DriverPublishedOn      = $null
+                DriverStatus           = "Installed"
             }
         }
     }
 
     # Add unmatched installed drivers
     $matchedVersions = $LinkedDrivers | Where-Object { $_.DriverVersion } | Select-Object -ExpandProperty DriverVersion
-    Start-Sleep -Seconds 1
     $unmatchedDrivers = $PNPSigned_Drivers | Where-Object { $matchedVersions -notcontains $_.DriverVersion }
 
-    # Combine all drivers
+    # Combine both sets of drivers using the same foreach pattern
     $LinkedDrivers = @(
-        $LinkedDrivers
+        $LinkedDrivers  # Include existing linked drivers
         foreach ($driver in $unmatchedDrivers) {
             [PSCustomObject]@{
-                WUName             = $null
-                DriverName         = $driver.DeviceName
-                DriverVersion      = $driver.DriverVersion
-                DriverReleaseDate  = if ($driver.DriverDate) { 
-                    $driver.DriverDate.ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ss.fffffffZ") 
+                WUName                 = $null
+                DriverName             = $driver.DeviceName
+                DriverVersion          = $driver.DriverVersion
+                DriverReleaseDate  = if ($driver.DriverDate) {
+                    $driver.DriverDate.ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ss.fffffffZ")
                 }
-                else { 
-                    $null 
+                else {
+                    $null
                 }
-                DriverClass        = $driver.DeviceClass
-                DriverID           = $driver.DeviceID
-                DriverHardwareID   = $driver.HardwareID
-                DriverManufacturer = $driver.Manufacturer
-                DriverInfName      = $driver.InfName
-                DriverLocation     = $driver.Location
-                DriverDescription  = $driver.Description
-                DriverProvider     = $driver.DriverProviderName
-                DriverPublishedOn  = $null
-                DriverStatus       = "Installed"
+                DriverClass            = $driver.DeviceClass
+                DriverID               = $driver.DeviceID
+                DriverHardwareID       = $driver.HardwareID
+                DriverManufacturer     = $driver.Manufacturer
+                DriverInfName          = $driver.InfName
+                DriverLocation         = $driver.Location
+                DriverDescription      = $driver.Description
+                DriverProvider         = $driver.DriverProviderName
+                DriverPublishedOn      = $null
+                DriverStatus           = "Installed"
             }
         }
     )
@@ -614,26 +589,26 @@ function Get-InstalledDrivers() {
     # Add optional updates to the list
     foreach ($optionalDriver in $OptionalWUList) {
         $LinkedDrivers += [PSCustomObject]@{
-            WUName             = $optionalDriver.WUName
-            DriverName         = $optionalDriver.DriverName
-            DriverVersion      = $optionalDriver.DriverVersion
-            DriverReleaseDate  = $optionalDriver.DriverReleaseDate
-            DriverClass        = $optionalDriver.DriverClass
-            DriverID           = $optionalDriver.DriverID
-            DriverHardwareID   = $optionalDriver.DriverHardwareID
-            DriverManufacturer = $optionalDriver.DriverManufacturer
-            DriverInfName      = $optionalDriver.DriverInfName
-            DriverLocation     = $optionalDriver.DriverLocation
-            DriverDescription  = $optionalDriver.DriverDescription
-            DriverProvider     = $optionalDriver.DriverProvider
-            DriverPublishedOn  = $optionalDriver.DriverPublishedOn
-            DriverStatus       = $optionalDriver.DriverStatus
+            WUName                 = $optionalDriver.WUName
+            DriverName             = $optionalDriver.DriverName
+            DriverVersion          = $optionalDriver.DriverVersion
+            DriverReleaseDate      = $optionalDriver.DriverDate
+            DriverClass            = $optionalDriver.DeviceClass
+            DriverID               = $optionalDriver.DeviceID
+            DriverHardwareID       = $optionalDriver.DriverHardwareID
+            DriverManufacturer     = $optionalDriver.Manufacturer
+            DriverInfName          = $optionalDriver.InfName
+            DriverLocation         = $optionalDriver.Location
+            DriverDescription      = $optionalDriver.Description
+            DriverProvider         = $optionalDriver.DriverProvider
+            DriverPublishedOn      = $optionalDriver.DriverChangeTime
+            DriverStatus           = $optionalDriver.DriverStatus
         }
     }
 
     Return $LinkedDrivers
-
 }
+
 
 # Function to get Dell Warranty
 function Get-DellWarranty(
@@ -1102,6 +1077,10 @@ function Start-PowerShellSysNative {
 #endregion functions
 
 #region script
+
+# Delete old logs
+(Get-ChildItem "C:\Windows\Logs" | Where-Object { $_.PSChildName -like "Intune_Inventory_*.log"}) | Remove-Item
+
 #Get Common data for App and Device Inventory:
 #Get Intune DeviceID and ManagedDeviceName
 if (@(Get-ChildItem HKLM:SOFTWARE\Microsoft\Enrollments\ -Recurse | Where-Object { $_.PSChildName -eq 'MS DM Server' })) {
@@ -1299,8 +1278,18 @@ if ($CollectDeviceInventory) {
                 'ServiceModel'            = $WarrantyData.ServiceModel
                 'ServiceTag'              = $WarrantyData.ServiceTag
                 'ServiceLevelDescription' = $WarrantyData.ServiceLevelDescription
-                'WarrantyStartDate'       = ([datetime]::Parse($WarrantyData.WarrantyStartDate)).ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ss.fffffffZ")
-                'WarrantyEndDate'         = ([datetime]::Parse($WarrantyData.WarrantyEndDate)).ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ss.fffffffZ")
+                'WarrantyStartDate'       = if ($WarrantyData.WarrantyStartDate){
+                ([datetime]::Parse($WarrantyData.WarrantyStartDate)).ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ss.fffffffZ")
+                }
+                else {
+                    $null
+                }
+                'WarrantyEndDate'         = if ($WarrantyData.WarrantyEndDate){
+                ([datetime]::Parse($WarrantyData.WarrantyEndDate)).ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ss.fffffffZ")
+                }
+                else {
+                    $null
+                }
             }
 
             $Warranty | Format-List         
@@ -1514,9 +1503,8 @@ if ($CollectAppInventory) {
 
 
 
-# region DRIVERINVENTORY
+#region DRIVERINVENTORY
 if ($CollectDriverInventory) {
-    Write-Output "Collect Driver Inventory"
     #Set Name of Log
     $DriverLog = "PowerStacksDriverInventory"
 
@@ -1612,7 +1600,7 @@ if ($CollectDriverInventory) {
     }
 }
 
-Stop-Transcript
+Stop-Transcript | Out-Null
 
 Write-Output $OutputMessage
 #endregion script
