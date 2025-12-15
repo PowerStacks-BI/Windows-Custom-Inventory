@@ -1079,7 +1079,7 @@ function Start-PowerShellSysNative {
 #region script
 
 # Delete old logs
-(Get-ChildItem "C:\Windows\Logs" | Where-Object { $_.PSChildName -like "Intune_Inventory_*.log"}) | Remove-Item
+Get-ChildItem "C:\Windows\Logs" -Filter "Intune_Inventory_*.log" | Where-Object { $_.FullName -ne $logPath } | Remove-Item -Force -ErrorAction SilentlyContinue
 
 #Get Common data for App and Device Inventory:
 #Get Intune DeviceID and ManagedDeviceName
