@@ -1413,6 +1413,7 @@ if ($CollectAppInventory) {
     $CleanAppList = $UniqueApps + $NewestDuplicateApp | Sort-Object DisplayName
     Write-Output 'Clean app list:'
     Write-Output $CleanAppList
+    Write-Output 'End clean app list.'
     
     $AppArray = @()
     foreach ($App in $CleanAppList) {
@@ -1420,6 +1421,7 @@ if ($CollectAppInventory) {
 
         if ($null -ne $App.DisplayName) {
             $tempapp | Add-Member -MemberType NoteProperty -Name "AppName" -Value $App.DisplayName -Force
+            Write-Output "Added $($App.DisplayName) to the app array"
         }
         else {
             $tempapp | Add-Member -MemberType NoteProperty -Name "AppName" -Value "" -Force
@@ -1470,7 +1472,10 @@ if ($CollectAppInventory) {
         $AppArray += $tempapp
     }
 
+    Write-Output 'About to convert app array to Json'
     $InstalledAppJson = $AppArray | ConvertTo-Json
+    Write-Output 'Converted app array to Json'
+
 
     $ms = New-Object System.IO.MemoryStream
     $cs = New-Object System.IO.Compression.GZipStream($ms, [System.IO.Compression.CompressionMode]::Compress)
@@ -1498,6 +1503,7 @@ if ($CollectAppInventory) {
 
     $AppJson = $MainApp | ConvertTo-Json   
     $ResponseAppInventory = Send-LogAnalyticsData -customerId $customerId -sharedKey $sharedKey -body ([System.Text.Encoding]::UTF8.GetBytes($AppJson)) -logType $AppLog
+    $ResponseAppInventory
 }
 # end region APPINVENTORY
 
@@ -1509,6 +1515,7 @@ if ($CollectDriverInventory) {
     $DriverLog = "PowerStacksDriverInventory"
 
     #get drivers
+    Write-Output "Begin: Get installed drivers"
     $Drivers = Get-InstalledDrivers
 
     $DriverArray = @()
@@ -1565,6 +1572,7 @@ if ($CollectDriverInventory) {
     # Submit the data to the API endpoint
     $ResponseDriverInventory = Send-LogAnalyticsData -customerId $customerId -sharedKey $sharedKey -body ([System.Text.Encoding]::UTF8.GetBytes($DriverJson)) -logType $DriverLog
 }
+Write-Output "End: Get installed drivers"
 #endregion DRIVERINVENTORY
 
 # Report back status
