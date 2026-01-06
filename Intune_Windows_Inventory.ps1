@@ -89,6 +89,9 @@
 - Fixed driver inventory bug with Get-Package provider
 - Added OS install date
 
+13 - January 6, 2026 
+- Modified to work with new log ingestion API
+
 ########### LEGAL DISCLAIMER ###########
     This script is provided "as is" without warranty of any kind, either express or implied. 
     Use at your own risk. Test thoroughly before deploying in production environments.
@@ -99,21 +102,49 @@
 # Enable TLS 1.2 support
 [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
 
+# "LogIngestionAPI" (Latest) or "DataCollectorAPI" (Legacy)
+$LogAPIMode = "LogIngestionAPI"
+
+########## Use for LogIngestionAPI #############
+
+# Replace with your Tenant ID in which the Data Collection Endpoint resides
+$TenantId = "<Enter Your Tenant ID>"
+
+# Replace with your Client ID created and granted permissions
+$ClientId = "<Enter Your Client ID>"
+
+# Replace with your Secret created for the above Client
+$ClientSecret = "<Enter Your Client Secret>"
+
+# Replace with your Data Collection Endpoint - Log Ingestion URL
+$DceURI = "<Enter Your DCE Log Ingestion URL>"
+
+# Replace with your Data Collection Rule - Immutable ID
+$DcrImmutableId = "<Enter Your Dcr Immutable ID>"
+
+#################################################
+
+########## Use for DataCollectorAPI #############
+
 # Replace with your Log Analytics Workspace ID
-$CustomerId = "<Enter Your Log Analytics Workspace ID>"   
+$CustomerId = "<Enter Your Log Analytics Workspace ID>"
 
 # Replace with your Primary Key
 $SharedKey = "<Enter Your Log Analytics Workspace Primary Key>"
+
+#################################################
 
 #Control if you want to collect Device, Win32 App, UWP App, and Driver Inventory. (True = Collect)
 $CollectDeviceInventory = $true
 $CollectAppInventory = $true
 $CollectDriverInventory = $true
-$CollectUWPInventory = $False # Set to true to collect UWP (modern app) inventory.
 
 #Sub-Control under Device Inventory
 $CollectMicrosoft365 = $true
-$CollectWarranty = $False # Set to true to collect warranty data
+$CollectWarranty = $false # Set to true to collect warranty data
+
+#Sub-Control under App Inventory
+$CollectUWPInventory = $false # Set to true to collect UWP (modern app) inventory.
 
 #Warranty keys
 $WarrantyDellClientID = "<Enter Your Dell Client ID>"
@@ -1103,7 +1134,7 @@ else {
 #region DEVICEINVENTORY
 if ($CollectDeviceInventory) {
     #Set Name of Log
-    $DeviceLog = "PowerStacksDeviceInventory"
+    $DeviceLog = "PowerStacksDeviceInventory$(if($LogAPIMode -eq "LogIngestionAPI"){"_CL"})"
 
     # Get Computer Inventory Information
     $ComputerLastBootUpTime = $ComputerInfo.OsLastBootUpTime.ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ss.fffffffZ")
@@ -1331,17 +1362,17 @@ if ($CollectDeviceInventory) {
     $sw.Close();
     $DeviceDetailsJson = [System.Convert]::ToBase64String($ms.ToArray())
 
-    $MainDevice = New-Object -TypeName PSObject
-    $MainDevice | Add-Member -MemberType NoteProperty -Name "ComputerName" -Value "$ComputerName" -Force
-    $MainDevice | Add-Member -MemberType NoteProperty -Name "ManagedDeviceID" -Value "$ManagedDeviceID" -Force
+      $MainDevice = New-Object -TypeName PSObject
+    $MainDevice | Add-Member -MemberType NoteProperty -Name "ComputerName$(if($LogAPIMode -eq "LogIngestionAPI"){"_s"})" -Value "$ComputerName" -Force
+    $MainDevice | Add-Member -MemberType NoteProperty -Name "ManagedDeviceID$(if($LogAPIMode -eq "LogIngestionAPI"){"_g"})" -Value "$ManagedDeviceID" -Force
     if ($CollectMicrosoft365) {
-        $MainDevice | Add-Member -MemberType NoteProperty -Name "Microsoft365" -Value $true -Force
+        $MainDevice | Add-Member -MemberType NoteProperty -Name "Microsoft365$(if($LogAPIMode -eq "LogIngestionAPI"){"_b"})" -Value $true -Force
     }
     if ($CollectWarranty -and $Warranty -and $Warranty.PSObject.Properties.Count -gt 0) {
         Write-Output "Warranty property count: $($Warranty.PSObject.Properties.Count)"
         Write-Output "Warranty data contents:`n$($WarrantyData | Out-String)"
         Write-Output "Warranty contents:`n$($Warranty | Out-String)"
-        $MainDevice | Add-Member -MemberType NoteProperty -Name "Warranty" -Value $true -Force
+        $MainDevice | Add-Member -MemberType NoteProperty -Name "Warranty$(if($LogAPIMode -eq "LogIngestionAPI"){"_b"})" -Value $true -Force
     }
     else {
         if (-not $CollectWarranty) {
@@ -1356,39 +1387,38 @@ if ($CollectDeviceInventory) {
         else {
             Write-Output "Warranty check did not meet conditions. Unexpected state."
         }
-
-        $MainDevice | Add-Member -MemberType NoteProperty -Name "Warranty" -Value $false -Force
+        $MainDevice | Add-Member -MemberType NoteProperty -Name "Warranty$(if($LogAPIMode -eq "LogIngestionAPI"){"_b"})" -Value $false -Force
     }
 
-    
-    
-    $DeviceDetailsJsonArr = $DeviceDetailsJson -split '(.{31744})'
-
+    $DeviceDetailsJsonArr = $DeviceDetailsJson -split "(.{$(if($LogAPIMode -eq 'LogIngestionAPI'){64512}else{31744})})"
     $i = 0
-
     foreach ($DeviceDetails in $DeviceDetailsJsonArr) {
-
         if ($DeviceDetails.Length -gt 0 ) {
             $i++
-            $MainDevice | Add-Member -MemberType NoteProperty -Name ("DeviceDetails" + $i.ToString()) -Value $DeviceDetails -Force
+            $MainDevice | Add-Member -MemberType NoteProperty -Name ("DeviceDetails" + $i.ToString() +"$(if($LogAPIMode -eq "LogIngestionAPI"){"_s"})") -Value $DeviceDetails -Force
         }
-
+    }   
+    if ($DeviceDetailsJson.Length -gt $(if($LogAPIMode -eq "LogIngestionAPI"){10*63*1024}else{10*31*1024})) {
+        throw "DeviceDetails is too big and exceeds the $(if($LogAPIMode -eq 'LogIngestionAPI'){64}else{32})Kb limit per column for a single upload. Please increase number of columns (#10). Current payload size is: $(($DeviceDetailsJson.Length/1024).ToString('#.#')) Kb"
     }
-    if ($DeviceDetailsJson.Length -gt (10 * 31 * 1024)) {
-        throw("DeviceDetails is too big and exceed the 32kb limit per column for a single upload. Please increase number of columns (#10). Current payload size is: " + ($DeviceDetailsJson.Length / 1024).ToString("#.#") + "kb")
-    }
-
-    $DeviceJson = $MainDevice | ConvertTo-Json
+    
+    $DeviceJson = if($LogAPIMode -eq "LogIngestionAPI") { "[$($MainDevice | ConvertTo-Json -Compress)]" } else { $MainDevice | ConvertTo-Json }
 
     # Submit the data to the API endpoint
-    $ResponseDeviceInventory = Send-LogAnalyticsData -customerId $customerId -sharedKey $sharedKey -body ([System.Text.Encoding]::UTF8.GetBytes($DeviceJson)) -logType $DeviceLog
+    $ResponseDeviceInventory =
+        if($LogAPIMode -eq "LogIngestionAPI") {
+            Send-LogIngestionAPI -tenantId $TenantId -clientId $ClientId -clientSecret $ClientSecret -body ([System.Text.Encoding]::UTF8.GetBytes($DeviceJson)) -dceURI $DceURI -dcrImmutableId $DcrImmutableId -logType $DeviceLog
+        } else {
+            Send-DataCollectorAPI -customerId $customerId -sharedKey $sharedKey -body ([System.Text.Encoding]::UTF8.GetBytes($DeviceJson)) -logType $DeviceLog
+        }
 }
 # end region DEVICEINVENTORY
 
 # region APPINVENTORY
 if ($CollectAppInventory) {
     Write-Output "Collect App Inventory"
-    $AppLog = "PowerStacksAppInventory"
+    #Set Name of Log
+    $AppLog = "PowerStacksAppInventory$(if($LogAPIMode -eq "LogIngestionAPI"){"_CL"})"
 
     $CurrentLoggedOnUser = (Get-WmiObject -Class win32_computersystem).UserName
     if ($CurrentLoggedOnUser -eq $null) {
@@ -1485,26 +1515,31 @@ if ($CollectAppInventory) {
     $InstalledAppJson = [System.Convert]::ToBase64String($ms.ToArray())
 
     $MainApp = New-Object -TypeName PSObject
-    $MainApp | Add-Member -MemberType NoteProperty -Name "ComputerName" -Value "$ComputerName" -Force
-    $MainApp | Add-Member -MemberType NoteProperty -Name "ManagedDeviceID" -Value "$ManagedDeviceID" -Force
+    $MainApp | Add-Member -MemberType NoteProperty -Name "ComputerName$(if($LogAPIMode -eq "LogIngestionAPI"){"_s"})" -Value "$ComputerName" -Force
+    $MainApp | Add-Member -MemberType NoteProperty -Name "ManagedDeviceID$(if($LogAPIMode -eq "LogIngestionAPI"){"_g"})" -Value "$ManagedDeviceID" -Force
 
-    $InstalledAppJsonArr = $InstalledAppJson -split '(.{31744})'
+    $InstalledAppJsonArr = $InstalledAppJson -split "(.{$(if($LogAPIMode -eq 'LogIngestionAPI'){64512}else{31744})})"
     $i = 0
     foreach ($InstalledApp in $InstalledAppJsonArr) {
-        if ($InstalledApp.Length -gt 0 ) {
-            $i++
-            $MainApp | Add-Member -MemberType NoteProperty -Name ("InstalledApps" + $i.ToString()) -Value $InstalledApp -Force
+            if ($InstalledApp.Length -gt 0 ) {
+                $i++
+                $MainApp | Add-Member -MemberType NoteProperty -Name ("InstalledApps" + $i.ToString() + "$(if($LogAPIMode -eq "LogIngestionAPI"){"_s"})") -Value $InstalledApp -Force
+            }
         }
-    }
+        if ($InstalledAppJson.Length -gt $(if($LogAPIMode -eq "LogIngestionAPI"){10*63*1024}else{10*31*1024})) {
+            throw("InstallApp is too big and exceed the $(if($LogAPIMode -eq 'LogIngestionAPI'){64}else{32})Kb limit per column for a single upload. Please increase number of columns (#10). Current payload size is: " + ($InstalledAppJson.Length / 1024).ToString("#.#") + "Kb")
+        }
 
-    if ($InstalledAppJson.Length -gt (10 * 31 * 1024)) {
-        throw("InstallApp is too big and exceed the 32kb limit per column for a single upload. Please increase number of columns (#10). Current payload size is: " + ($InstalledAppJson.Length / 1024).ToString("#.#") + "kb")
-    }
+        $AppJson = if($LogAPIMode -eq "LogIngestionAPI") { "[$($MainApp | ConvertTo-Json -Compress)]" } else { $MainApp | ConvertTo-Json }
 
-    $AppJson = $MainApp | ConvertTo-Json   
-    $ResponseAppInventory = Send-LogAnalyticsData -customerId $customerId -sharedKey $sharedKey -body ([System.Text.Encoding]::UTF8.GetBytes($AppJson)) -logType $AppLog
-    $ResponseAppInventory
-}
+        # Submit the data to the API endpoint
+        $ResponseAppInventory =
+            if($LogAPIMode -eq "LogIngestionAPI") {
+                Send-LogIngestionAPI -tenantId $TenantId -clientId $ClientId -clientSecret $ClientSecret -body ([System.Text.Encoding]::UTF8.GetBytes($AppJson)) -dceURI $DceURI -dcrImmutableId $DcrImmutableId -logType $AppLog
+            } else {
+                Send-DataCollectorAPI -customerId $customerId -sharedKey $sharedKey -body ([System.Text.Encoding]::UTF8.GetBytes($AppJson)) -logType $AppLog
+            }
+    }
 # end region APPINVENTORY
 
 
@@ -1512,7 +1547,7 @@ if ($CollectAppInventory) {
 #region DRIVERINVENTORY
 if ($CollectDriverInventory) {
     #Set Name of Log
-    $DriverLog = "PowerStacksDriverInventory"
+    $DriverLog = "PowerStacksDriverInventory$(if($LogAPIMode -eq "LogIngestionAPI"){"_CL"})"
 
     #get drivers
     Write-Output "Begin: Get installed drivers"
@@ -1548,41 +1583,39 @@ if ($CollectDriverInventory) {
     $ListedDriverJson = [System.Convert]::ToBase64String($ms.ToArray())
 
     $MainDriver = New-Object -TypeName PSObject
-    $MainDriver | Add-Member -MemberType NoteProperty -Name "ComputerName" -Value "$ComputerName" -Force
-    $MainDriver | Add-Member -MemberType NoteProperty -Name "ManagedDeviceID" -Value "$ManagedDeviceID" -Force
+    $MainDriver | Add-Member -MemberType NoteProperty -Name "ComputerName$(if($LogAPIMode -eq "LogIngestionAPI"){"_s"})" -Value "$ComputerName" -Force
+    $MainDriver | Add-Member -MemberType NoteProperty -Name "ManagedDeviceID$(if($LogAPIMode -eq "LogIngestionAPI"){"_g"})" -Value "$ManagedDeviceID" -Force
 
-    $ListedDriverJsonArr = $ListedDriverJson -split '(.{31744})'
-
+    $ListedDriverJsonArr = $ListedDriverJson -split "(.{$(if($LogAPIMode -eq 'LogIngestionAPI'){64512}else{31744})})"
     $i = 0
-
     foreach ($ListedDriver in $ListedDriverJsonArr) {
-
         if ($ListedDriver.Length -gt 0 ) {
             $i++
-            $MainDriver | Add-Member -MemberType NoteProperty -Name ("ListedDrivers" + $i.ToString()) -Value $ListedDriver -Force
+            $MainDriver | Add-Member -MemberType NoteProperty -Name ("ListedDrivers" + $i.ToString() + "$(if($LogAPIMode -eq "LogIngestionAPI"){"_s"})") -Value $ListedDriver -Force
         }
-
     }
-    if ($ListedDriverJson.Length -gt (10 * 31 * 1024)) {
-        throw("Driver is too big and exceed the 32kb limit per column for a single upload. Please increase number of columns (#10). Current payload size is: " + ($ListedDriverJson.Length / 1024).ToString("#.#") + "kb")
+    if ($ListedDriverJson.Length -gt $(if($LogAPIMode -eq "LogIngestionAPI"){10*63*1024}else{10*31*1024})) {
+        throw("Driver is too big and exceed the $(if($LogAPIMode -eq 'LogIngestionAPI'){64}else{32})Kb limit per column for a single upload. Please increase number of columns (#10). Current payload size is: " + ($ListedDriverJson.Length / 1024).ToString("#.#") + "Kb")
     }
 
-    $DriverJson = $MainDriver | ConvertTo-Json
+    $DriverJson = if($LogAPIMode -eq "LogIngestionAPI") { "[$($MainDriver | ConvertTo-Json -Compress)]" } else { $MainDriver | ConvertTo-Json }
 
     # Submit the data to the API endpoint
-    $ResponseDriverInventory = Send-LogAnalyticsData -customerId $customerId -sharedKey $sharedKey -body ([System.Text.Encoding]::UTF8.GetBytes($DriverJson)) -logType $DriverLog
+    $ResponseDriverInventory =
+        if($LogAPIMode -eq "LogIngestionAPI") {
+            Send-LogIngestionAPI -tenantId $TenantId -clientId $ClientId -clientSecret $ClientSecret -body ([System.Text.Encoding]::UTF8.GetBytes($DriverJson)) -dceURI $DceURI -dcrImmutableId $DcrImmutableId -logType $DriverLog
+        } else {
+            Send-DataCollectorAPI -customerId $customerId -sharedKey $sharedKey -body ([System.Text.Encoding]::UTF8.GetBytes($DriverJson)) -logType $DriverLog
+        }
 }
-Write-Output "End: Get installed drivers"
 #endregion DRIVERINVENTORY
 
 # Report back status
-Write-Output "Report back status"
 $date = (Get-Date).ToUniversalTime().ToString($InventoryDateFormat)
 $OutputMessage = "InventoryDate: $date "
 
 if ($CollectDeviceInventory) {
-    if ($ResponseDeviceInventory -match "200 :") {
-
+    if ($ResponseDeviceInventory -match "$(if($LogAPIMode -eq 'LogIngestionAPI'){204}else{200}) :") {
         $OutputMessage = $OutPutMessage + "DeviceInventory: OK " + $ResponseDeviceInventory
     }
     else {
@@ -1590,8 +1623,7 @@ if ($CollectDeviceInventory) {
     }
 }
 if ($CollectAppInventory) {
-    if ($ResponseAppInventory -match "200 :") {
-
+    if ($ResponseAppInventory -match "$(if($LogAPIMode -eq 'LogIngestionAPI'){204}else{200}) :") {
         $OutputMessage = $OutPutMessage + " AppInventory: OK " + $ResponseAppInventory
     }
     else {
@@ -1599,8 +1631,7 @@ if ($CollectAppInventory) {
     }
 }
 if ($CollectDriverInventory) {
-    if ($ResponseDriverInventory -match "200 :") {
-
+    if ($ResponseDriverInventory -match "$(if($LogAPIMode -eq 'LogIngestionAPI'){204}else{200}) :") {
         $OutputMessage = $OutPutMessage + " DriverInventory: OK " + $ResponseDriverInventory
     }
     else {
