@@ -92,6 +92,9 @@
 13 - January 6, 2026 
 - Modified to work with new log ingestion API
 
+14 - January 20, 2026
+- Added missing Send-LogIngestionAPI function
+
 ########### LEGAL DISCLAIMER ###########
     This script is provided "as is" without warranty of any kind, either express or implied. 
     Use at your own risk. Test thoroughly before deploying in production environments.
@@ -1065,6 +1068,130 @@ Function Send-LogAnalyticsData(
     }
 
     $response = Invoke-WebRequest -Uri $uri -Method $method -ContentType $contentType -Headers $headers -Body $body -UseBasicParsing
+    $statusmessage = "$($response.StatusCode) : $($payloadsize)"
+    return $statusmessage
+}
+
+# Function to create and post the request using DataCollectorAPI
+Function Send-DataCollectorAPI(
+    <#
+    .SYNOPSIS
+    Sends data to Azure Log Analytics.
+    .DESCRIPTION
+    Compresses and uploads JSON data to Azure Log Analytics using the provided credentials and log type.
+    .PARAMETER customerId
+    The Log Analytics Workspace ID.
+    .PARAMETER sharedKey
+    The Log Analytics Primary Key.
+    .PARAMETER body
+    The request body (JSON, as bytes).
+    .PARAMETER logType
+    The custom log type name.
+    .OUTPUTS
+    String with the HTTP status code and payload size.
+    #>    
+    $customerId, $sharedKey, $body, $logType) {
+    $method = "POST"
+    $contentType = "application/json"
+    $resource = "/api/logs"
+    $rfc1123date = [DateTime]::UtcNow.ToString("r")
+    $contentLength = $body.Length
+    $signature = New-Signature `
+        -customerId $customerId `
+        -sharedKey $sharedKey `
+        -date $rfc1123date `
+        -contentLength $contentLength `
+        -method $method `
+        -contentType $contentType `
+        -resource $resource
+    $uri = "https://" + $customerId + ".ods.opinsights.azure.com" + $resource + "?api-version=2016-04-01"
+
+    #validate that payload data does not exceed limits
+    if ($body.Length -gt (31.9 * 1024 * 1024)) {
+        throw("Upload payload is too big and exceed the 32Mb limit for a single upload. Please reduce the payload size. Current payload size is: " + ($body.Length / 1024 / 1024).ToString("#.#") + "Mb")
+    }
+
+    $payloadsize = ("Upload payload size is " + ($body.Length / 1024).ToString("#.#") + "Kb ")
+
+    $headers = @{
+        "Authorization"        = $signature;
+        "Log-Type"             = $logType;
+        "x-ms-date"            = $rfc1123date;
+        "time-generated-field" = $TimeStampField;
+    }
+
+    $response = Invoke-WebRequest -Uri $uri -Method $method -ContentType $contentType -Headers $headers -Body $body -UseBasicParsing
+    $statusmessage = "$($response.StatusCode) : $($payloadsize)"
+    return $statusmessage
+}
+# Function to create the bearer token
+Function New-BearerToken(
+    # Function to create the Bearer Token
+    <#
+.SYNOPSIS
+    Creates a bearer token for Azure Log Ingestion API.
+.DESCRIPTION
+    Generates a bearer token for authenticating requests to Azure Log Analytics.
+.PARAMETER tenantId
+    The tenant ID in which the Data Collection Endpoint resides
+.PARAMETER clientId
+    The client ID created and granted permissions
+.PARAMETER clientSecret
+    The secret created for the above client
+.OUTPUTS
+    String containing the bearer token value.
+#>    
+    $tenantId, $clientId, $clientSecret){
+    $scope = [System.Web.HttpUtility]::UrlEncode("https://monitor.azure.com//.default")
+    $body = "client_id=$clientId&scope=$scope&client_secret=$clientSecret&grant_type=client_credentials"
+    $headers = @{"Content-Type" = "application/x-www-form-urlencoded" }
+    $uri = "https://login.microsoftonline.com/$tenantId/oauth2/v2.0/token"
+    $bearerToken = (Invoke-RestMethod -Uri $uri -Method "Post" -Body $body -Headers $headers).access_token
+
+    return $bearerToken
+}
+
+# Function to create and post the request using LogIngestionAPI
+Function Send-LogIngestionAPI(
+    <#
+    .SYNOPSIS
+    Sends data to Azure Log Analytics.
+    .DESCRIPTION
+    Compresses and uploads JSON data to Azure Log Analytics using the provided credentials and log type.
+    .PARAMETER customerId
+    The Log Analytics Workspace ID.
+    .PARAMETER sharedKey
+    The Log Analytics Primary Key.
+    .PARAMETER body
+    The request body (JSON, as bytes).
+    .PARAMETER logType
+    The custom log type name.
+    .OUTPUTS
+    String with the HTTP status code and payload size.
+    #>    
+    $tenantId, $clientId, $clientSecret, $body, $dceURI, $dcrImmutableId, $logType) {
+    $method = "POST"
+    $contentType = "application/json"
+    $bearerToken = New-BearerToken `
+        -tenantId $tenantId `
+        -clientId $clientId `
+        -clientSecret $clientSecret `
+
+    $uri = "$dceURI/dataCollectionRules/$dcrImmutableId/streams/Custom-$logType"+"?api-version=2023-01-01"
+
+    #validate that payload data does not exceed limits
+    if ($body.Length -gt (0.9 * 1024 * 1024)) {
+        throw("Upload payload is too big and exceed the 1Mb limit for a single upload. Please reduce the payload size. Current payload size is: " + ($body.Length / 1024 / 1024).ToString("#.#") + "Mb")
+    }
+
+    $payloadsize = ("Upload payload size is " + ($body.Length / 1024).ToString("#.#") + "Kb ")
+
+    $headers = @{
+        "Authorization" = "Bearer $bearerToken"
+        "Content-Type"  = $contentType
+    }
+
+    $response = Invoke-WebRequest -Uri $uri -Method $method -Headers $headers -Body $body -UseBasicParsing
     $statusmessage = "$($response.StatusCode) : $($payloadsize)"
     return $statusmessage
 }
