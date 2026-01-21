@@ -95,6 +95,9 @@
 14 - January 20, 2026
 - Added missing Send-LogIngestionAPI function
 
+15 - January 21, 2026
+- Added SCCM style logging
+
 ########### LEGAL DISCLAIMER ###########
     This script is provided "as is" without warranty of any kind, either express or implied. 
     Use at your own risk. Test thoroughly before deploying in production environments.
@@ -106,7 +109,7 @@
 [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
 
 # Current script version. ALWAYS UPDATE MANUALLY!
-$ScriptVersion = '14 - January 20, 2026'
+$ScriptVersion = '15 - January 21, 2026'
 
 
 # Current date/time
