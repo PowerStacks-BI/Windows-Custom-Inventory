@@ -158,6 +158,7 @@ $SharedKey = "<Enter Your Log Analytics Workspace Primary Key>"
 $CollectDeviceInventory = $true
 $CollectAppInventory = $true
 $CollectDriverInventory = $true
+$MatchDrivers = $true # One customer reported that matching the drives was taking hours on a subset of devices. Set to false to skip the matching process and just report the raw driver data from Get-Package.
 
 #Sub-Control under Device Inventory
 $CollectMicrosoft365 = $true
@@ -737,6 +738,7 @@ function Get-InstalledDrivers() {
         $PNPSigned_Drivers = @()
     }
 
+    if ($MatchDrivers){
     # Get installed MSU packages
     Write-CMTraceLog "Get-InstalledDrivers: Retrieving installed MSU driver packages..."
     try {
@@ -829,6 +831,7 @@ function Get-InstalledDrivers() {
         }
     }
     Write-CMTraceLog "Get-InstalledDrivers: Linked $($LinkedDrivers.Count) MSU packages to PnP drivers"
+}
 
     # Add unmatched installed drivers
     Write-CMTraceLog "Get-InstalledDrivers: Finding unmatched PnP drivers..."
