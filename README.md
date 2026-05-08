@@ -8,7 +8,7 @@ The script provides granular control over the type of inventory collected, inclu
 
 For implementation guidance and integration with the BI for Intune reporting solution, refer to the documentation below.
 
-🔗 [Inventory Collection Script – PowerStacks BI for Intune Documentation](https://powerstacks.com/bi-for-intune-kb/intune-inventory-collection-script-windows/)
+🔗 [Windows Inventory Collection Script – PowerStacks BI for Intune Documentation](https://docs.powerstacks.com/bi-for-intune/installation/custom-inventory/windows-inventory-collection-script/)
 
 ## Features
 
