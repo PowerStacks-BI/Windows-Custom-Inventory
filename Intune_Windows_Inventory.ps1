@@ -139,8 +139,25 @@ $ClientSecret = "<Enter Your Client Secret>"
 # Replace with your Data Collection Endpoint - Log Ingestion URL
 $DceURI = "<Enter Your DCE Log Ingestion URL>"
 
-# Replace with your Data Collection Rule - Immutable ID
+# Replace with your Data Collection Rule - Immutable ID. For high-volume fleets you can
+# scale out across multiple DCRs behind the same DCE (each DCR has its own ingestion
+# limit): set this to a list and the script spreads load across them, for example
+#   $DcrImmutableId = @("dcr-aaaa...", "dcr-bbbb...", "dcr-cccc...")
 $DcrImmutableId = "<Enter Your Dcr Immutable ID>"
+
+# OPTIONAL secretless ingestion: route uploads through the in-tenant ingestion
+# Function (managed identity) instead of the client secret above. When set to a real
+# URL, the ClientSecret path is bypassed entirely. Leave the placeholder to keep
+# using the classic client-secret upload.
+$FunctionUrl = "<Enter Your Ingestion Function URL>"
+
+# Submission retry: on a rejected upload, wait, retry, and double the wait each time,
+# capping the wait at $SubmissionMaxWaitSeconds, up to $SubmissionMaxRetries before
+# giving up for this run. The defaults give waits of 60, 120, 240, 360, 360 seconds
+# (~19 minutes total). Keep that worst-case total within your Intune remediation timeout.
+$SubmissionMaxRetries = 5
+$SubmissionInitialWaitSeconds = 60
+$SubmissionMaxWaitSeconds = 360
 
 #################################################
 
@@ -1414,6 +1431,43 @@ Function New-BearerToken(
     return $bearerToken
 }
 
+# Posts a submission with DCR-pool failover and exponential-backoff retry. $Uris is one
+# or more equivalent targets (a pool of DCRs for the classic path, or the single Function
+# URL). Each cycle tries every target once with no wait, so a single throttled or failing
+# DCR fails over instantly to a sibling that has its own budget; only if the whole pool
+# rejects the submission does it back off and cycle again, up to $SubmissionMaxRetries.
+# Returns the response on success, or $null after exhausting retries, so a failed stream
+# does not abort the run. $StartIndex spreads devices evenly across the pool.
+Function Invoke-LogSubmission([string[]]$Uris, $Body, [hashtable]$Headers = @{}, [int]$StartIndex = 0) {
+    $n = $Uris.Count
+    if ($n -lt 1) { return $null }
+    $lastCode = $null
+    $lastMsg = ""
+    $cycle = 0
+    $wait = [Math]::Min($SubmissionInitialWaitSeconds, $SubmissionMaxWaitSeconds)
+    while ($true) {
+        for ($i = 0; $i -lt $n; $i++) {
+            $uri = $Uris[($StartIndex + $cycle + $i) % $n]
+            try {
+                return Invoke-WebRequest -Uri $uri -Method "POST" -Headers $Headers -Body $Body -ContentType "application/json" -UseBasicParsing
+            }
+            catch {
+                $lastCode = $null
+                if ($_.Exception.Response) { try { $lastCode = [int]$_.Exception.Response.StatusCode } catch {} }
+                $lastMsg = $_.Exception.Message
+            }
+        }
+        if ($cycle -ge $SubmissionMaxRetries) {
+            Write-CMTraceLog "Submission failed after $cycle backoff cycle(s) across $n target(s) (last status: $lastCode): $lastMsg" -ErrorMsg
+            return $null
+        }
+        $cycle++
+        Write-CMTraceLog "All $n target(s) rejected the submission (last status: $lastCode). Retry $cycle of $SubmissionMaxRetries in $wait second(s)..." -WarningMsg
+        Start-Sleep -Seconds $wait
+        $wait = [Math]::Min($wait * 2, $SubmissionMaxWaitSeconds)
+    }
+}
+
 # Function to create and post the request using LogIngestionAPI
 Function Send-LogIngestionAPI(
     <#
@@ -1435,12 +1489,6 @@ Function Send-LogIngestionAPI(
     $tenantId, $clientId, $clientSecret, $body, $dceURI, $dcrImmutableId, $logType) {
     $method = "POST"
     $contentType = "application/json"
-    $bearerToken = New-BearerToken `
-        -tenantId $tenantId `
-        -clientId $clientId `
-        -clientSecret $clientSecret `
-
-    $uri = "$dceURI/dataCollectionRules/$dcrImmutableId/streams/Custom-$logType"+"?api-version=2023-01-01"
 
     #validate that payload data does not exceed limits
     if ($body.Length -gt (0.9 * 1024 * 1024)) {
@@ -1449,12 +1497,36 @@ Function Send-LogIngestionAPI(
 
     $payloadsize = ("Upload payload size is " + ($body.Length / 1024).ToString("#.#") + "Kb ")
 
-    $headers = @{
-        "Authorization" = "Bearer $bearerToken"
-        "Content-Type"  = $contentType
+    # Secretless path: when an ingestion Function URL is configured, post through it.
+    # One call per inventory type. We do NOT combine types into one call: the limit is
+    # per DCR, and the Function makes the same per-stream DCR calls either way, so
+    # combining saves nothing and only adds complexity.
+    if ($FunctionUrl -and $FunctionUrl -notmatch '^<Enter') {
+        $rows = [System.Text.Encoding]::UTF8.GetString($body) | ConvertFrom-Json
+        $envelope = @{ submissions = @( @{ stream = "Custom-$logType"; rows = @($rows) } ) } | ConvertTo-Json -Depth 20 -Compress
+        $response = Invoke-LogSubmission -Uris @($FunctionUrl) -Body $envelope
+        if ($null -eq $response) { return "Function upload failed after retries : $payloadsize" }
+        # The Function returns 2xx on success and a non-2xx (retried above) on failure.
+        # Normalize success to the "204 :" the status report checks for.
+        return "204 : $payloadsize"
     }
 
-    $response = Invoke-WebRequest -Uri $uri -Method $method -Headers $headers -Body $body -UseBasicParsing
+    # Classic path: mint a client-secret token and post straight to the DCR. Supports a
+    # pool of DCRs (scale-out): build one target URL per DCR id, and spread devices across
+    # the pool with a stable per-device start index so each DCR carries a roughly equal share.
+    $bearerToken = New-BearerToken -tenantId $tenantId -clientId $clientId -clientSecret $clientSecret
+    $uris = @(@($dcrImmutableId) | ForEach-Object { "$dceURI/dataCollectionRules/$_/streams/Custom-$logType" + "?api-version=2023-01-01" })
+    $headers = @{ "Authorization" = "Bearer $bearerToken" }
+
+    $startIndex = 0
+    if ($ManagedDeviceID -and $uris.Count -gt 1) {
+        $sum = 0
+        foreach ($ch in $ManagedDeviceID.ToCharArray()) { $sum += [int][char]$ch }
+        $startIndex = $sum % $uris.Count
+    }
+
+    $response = Invoke-LogSubmission -Uris $uris -Body $body -Headers $headers -StartIndex $startIndex
+    if ($null -eq $response) { return "DCR upload failed after retries : $payloadsize" }
     $statusmessage = "$($response.StatusCode) : $($payloadsize)"
     return $statusmessage
 }
