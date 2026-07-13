@@ -107,6 +107,7 @@
 - Hardened user-SID resolution: when the logged-on account can't be translated to a SID
   (IdentityNotMappedException), fall back to the user profile list and, failing that, continue without
   a user SID (machine-scope app inventory only) instead of throwing.
+- Use HTTPS instead of HTTP for the Lenovo warranty API endpoint.
 
 ########### LEGAL DISCLAIMER ###########
     This script is provided "as is" without warranty of any kind, either express or implied. 
@@ -1035,7 +1036,7 @@ function Get-LenovoWarranty(
 #>    
     [Parameter(Mandatory = $true)]$SourceDevice) {
     $headersReq = @{ "ClientID" = $WarrantyLenovoClientID }
-    $WarReq = Invoke-RestMethod -Uri "http://supportapi.lenovo.com/V2.5/Warranty?Serial=$SourceDevice" -Headers $headersReq -Method Get -ContentType "application/json"
+    $WarReq = Invoke-RestMethod -Uri "https://supportapi.lenovo.com/V2.5/Warranty?Serial=$SourceDevice" -Headers $headersReq -Method Get -ContentType "application/json"
     
     try {
         $Warlist = $WarReq.Warranty | Where-Object { ($_.ID -eq "36Y") -or ($_.ID -eq "3EZ") -or ($_.ID -eq "12B") -or ($_.ID -eq "1EZ") }
