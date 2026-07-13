@@ -688,42 +688,40 @@ function Get-Microsoft365 {
 
 
     if ($CDNChannel) {
-        Write-CMTraceLog "Get-Microsoft365: Querying CDN channel API for $CDNChannel..."
+        Write-CMTraceLog "Get-Microsoft365: Querying Office releases API for channel $CDNChannel..."
         try {
-            $CDNUrl = "https://clients.config.office.net/releases/v1.0/LatestRelease/$CDNChannel"
+            # The per-channel endpoint (releases/v1.0/LatestRelease/<channel>) was retired by Microsoft.
+            # OfficeReleases returns every channel in one array; select ours and read the newest build.
+            $CDNUrl = "https://clients.config.office.net/releases/v1.0/OfficeReleases"
             Write-CMTraceLog "Get-Microsoft365: Calling $CDNUrl"
             $CDNResp = Invoke-RestMethod -Uri $CDNUrl -Method GET -ErrorAction Stop
-            Write-CMTraceLog "Get-Microsoft365: CDN API response received"
 
-            if (-not $EndOfSupportDate -and $CDNResp.endOfSupportDate -ne '0001-01-01T00:00:00Z') {
-                $EndOfSupportDate = $CDNResp.endOfSupportDate
-                Write-CMTraceLog "EndOfSupportDate pulled from CDN: $EndOfSupportDate"
-            }
+            $CDNChan = $CDNResp | Where-Object {
+                $_.channelId -eq $CDNChannel -or $_.channel -eq $CDNChannel -or ($_.alternateNames -contains $CDNChannel)
+            } | Select-Object -First 1
+            $CDNRel = $CDNChan.officeVersions | Select-Object -First 1
 
-            if (-not $ReleaseDate -and $CDNResp.availabilityDate) {
-                $ReleaseDate = $CDNResp.availabilityDate
-                Write-CMTraceLog "ReleaseDate pulled from CDN"
-            }
-
-            if (-not $LatestReleaseVersion -and $CDNResp.buildVersion.buildVersionString) {
-                $LatestReleaseVersion = $CDNResp.buildVersion.buildVersionString
-                Write-CMTraceLog "ReleaseVersion pulled from CDN"
-            }
-
-            if (-not $ReleaseID -and $CDNResp.releaseVersion) {
-                $ReleaseID = $CDNResp.releaseVersion
-                Write-CMTraceLog "ReleaseID pulled from CDN"
-            }
-
-            if (-not $LatestReleaseType -or $LatestReleaseType -eq 'Default') {
-                $ReleaseTypes = @{ 1 = 'Feature Update'; 2 = 'Quality Update'; 3 = 'Security Update' }
-                $LatestReleaseType = $ReleaseTypes[$CDNResp.releaseType]
-                if (-not $LatestReleaseType -and $CDNResp.releaseType -ne $null) {
-                    $LatestReleaseType = "$($CDNResp.releaseType)"  # fallback to raw value
+            if ($CDNChan) {
+                if (-not $EndOfSupportDate -and $CDNRel.endOfSupportDate -and $CDNRel.endOfSupportDate -ne '0001-01-01T00:00:00Z') {
+                    $EndOfSupportDate = $CDNRel.endOfSupportDate
+                    Write-CMTraceLog "EndOfSupportDate pulled from CDN: $EndOfSupportDate"
                 }
-                Write-CMTraceLog "ReleaseType pulled from CDN: $LatestReleaseType"
+                if (-not $ReleaseDate -and $CDNRel.availabilityDate) {
+                    $ReleaseDate = $CDNRel.availabilityDate
+                    Write-CMTraceLog "ReleaseDate pulled from CDN"
+                }
+                if (-not $LatestReleaseVersion -and $CDNChan.latestVersion) {
+                    $LatestReleaseVersion = $CDNChan.latestVersion
+                    Write-CMTraceLog "ReleaseVersion pulled from CDN"
+                }
+                if (-not $ReleaseID -and $CDNRel.releaseVersion) {
+                    $ReleaseID = $CDNRel.releaseVersion
+                    Write-CMTraceLog "ReleaseID pulled from CDN"
+                }
             }
-
+            else {
+                Write-CMTraceLog "Get-Microsoft365: No matching channel '$CDNChannel' in OfficeReleases response" -WarningMsg
+            }
         }
         catch {
             Write-CMTraceLog "Get-Microsoft365: CDN API failed: $_" -WarningMsg
