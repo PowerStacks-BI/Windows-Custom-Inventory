@@ -98,11 +98,11 @@
 15 - January 21, 2026
 - Added SCCM style logging
 
-16 - July 10, 2026
-- Replaced the non-functional in-tenant Function relay (previous secretless option) with the
-  PowerStacks Entra Token Broker. When $BrokerUrl is set, the device authenticates to the broker with
-  its Entra Join certificate (mutual TLS) and posts to the DCR using a broker-minted token - no secret
-  on the device and no relay hop. Added the $BrokerUrl and $BrokerClientId settings.
+17 - July 13, 2026
+- Added secretless ingestion support using the PowerStacks Entra Token Broker. When $BrokerUrl is set,
+  the device authenticates to the broker with its Entra Join certificate (mutual TLS) and posts to the
+  DCR using a broker-minted token - no secret on the device and no relay hop. Added the $BrokerUrl and
+  $BrokerClientId settings. This replaces the earlier non-functional in-tenant Function relay.
 - The legacy Data Collector API path and the classic client-secret DCR/DCE path are unchanged.
 - Hardened user-SID resolution: when the logged-on account can't be translated to a SID
   (IdentityNotMappedException), fall back to the user profile list and, failing that, continue without
@@ -120,7 +120,7 @@
 [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
 
 # Current script version. ALWAYS UPDATE MANUALLY!
-$ScriptVersion = '16 - July 10, 2026'
+$ScriptVersion = '17 - July 13, 2026'
 
 
 # Current date/time
