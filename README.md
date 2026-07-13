@@ -32,6 +32,42 @@ For implementation guidance and integration with the BI for Intune reporting sol
 | `RemoveBuiltInMonitors`   | Exclude internal monitors from results (default: `$false`)                 |
 | `InventoryDateFormat`     | Timestamp formatting for final status output (default: `"MM-dd HH:mm"`)    |
 
+## Ingestion & authentication
+
+`$LogAPIMode` (top of the script) selects how data reaches Log Analytics:
+
+- **`DataCollectorAPI`** – the legacy HTTP Data Collector API (workspace ID + shared key).
+- **`LogIngestionAPI`** (recommended) – the modern Logs Ingestion API, posting to a Data Collection Endpoint (DCE) / Data Collection Rule (DCR).
+
+Under `LogIngestionAPI`, the token used to post to the DCR can be obtained two ways:
+
+1. **Client secret (classic).** An Entra app registration client id + secret embedded in the script (`$ClientId` / `$ClientSecret`). Simple, but every device carries a reusable secret.
+2. **PowerStacks Entra Token Broker (secretless, recommended).** When `$BrokerUrl` is set, the device authenticates to the broker with its **Entra Join certificate** (mutual TLS), receives a short-lived signed assertion, and exchanges it for the inventory managed identity's token — **no secret on the device and no relay hop**. The upload to the DCR is otherwise identical.
+
+### Broker settings
+
+| Setting          | Description                                                                                                   |
+|------------------|---------------------------------------------------------------------------------------------------------------|
+| `$BrokerUrl`     | The Entra Token Broker URL, e.g. `https://<broker>.azurewebsites.net`. Leave the placeholder to disable broker mode. |
+| `$BrokerClientId`| The broker's **inventory user-assigned managed identity** client id (broker deploy output `inventoryIdentityClientId`). Not the app registration. |
+
+Precedence: if `$BrokerUrl` is set it is used; otherwise the script falls back to `$ClientId` / `$ClientSecret`. `$TenantId`, `$DceURI`, and `$DcrImmutableId` are required in both cases.
+
+Requirements for broker mode:
+- The device must be **Entra joined** (or hybrid-joined) and the script must run as **SYSTEM / elevated** — the Entra Join certificate's private key is TPM-bound and machine-scoped.
+- The broker's inventory managed identity must hold **Monitoring Metrics Publisher** on the target DCR.
+
+```powershell
+# LogIngestionAPI via the broker (secretless)
+$LogAPIMode     = "LogIngestionAPI"
+$TenantId       = "<tenant guid>"
+$DceURI         = "https://<dce>.<region>.ingest.monitor.azure.com"
+$DcrImmutableId = "dcr-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+$BrokerUrl      = "https://<broker>.azurewebsites.net"
+$BrokerClientId = "<inventoryIdentityClientId>"
+# leave $ClientId / $ClientSecret as placeholders
+```
+
 ## Usage
 
 ```powershell

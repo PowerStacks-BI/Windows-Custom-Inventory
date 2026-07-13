@@ -98,6 +98,16 @@
 15 - January 21, 2026
 - Added SCCM style logging
 
+16 - July 10, 2026
+- Replaced the non-functional in-tenant Function relay (previous secretless option) with the
+  PowerStacks Entra Token Broker. When $BrokerUrl is set, the device authenticates to the broker with
+  its Entra Join certificate (mutual TLS) and posts to the DCR using a broker-minted token - no secret
+  on the device and no relay hop. Added the $BrokerUrl and $BrokerClientId settings.
+- The legacy Data Collector API path and the classic client-secret DCR/DCE path are unchanged.
+- Hardened user-SID resolution: when the logged-on account can't be translated to a SID
+  (IdentityNotMappedException), fall back to the user profile list and, failing that, continue without
+  a user SID (machine-scope app inventory only) instead of throwing.
+
 ########### LEGAL DISCLAIMER ###########
     This script is provided "as is" without warranty of any kind, either express or implied. 
     Use at your own risk. Test thoroughly before deploying in production environments.
@@ -109,7 +119,7 @@
 [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
 
 # Current script version. ALWAYS UPDATE MANUALLY!
-$ScriptVersion = '15 - January 21, 2026'
+$ScriptVersion = '16 - July 10, 2026'
 
 
 # Current date/time
@@ -145,11 +155,15 @@ $DceURI = "<Enter Your DCE Log Ingestion URL>"
 #   $DcrImmutableId = @("dcr-aaaa...", "dcr-bbbb...", "dcr-cccc...")
 $DcrImmutableId = "<Enter Your Dcr Immutable ID>"
 
-# OPTIONAL secretless ingestion: route uploads through the in-tenant ingestion
-# Function (managed identity) instead of the client secret above. When set to a real
-# URL, the ClientSecret path is bypassed entirely. Leave the placeholder to keep
-# using the classic client-secret upload.
-$FunctionUrl = "<Enter Your Ingestion Function URL>"
+# OPTIONAL secretless ingestion via the PowerStacks Entra Token Broker. When $BrokerUrl is set to a
+# real URL, the device authenticates to the broker with its Entra Join certificate (mutual TLS),
+# receives a short-lived signed assertion, and posts straight to the DCR using a broker-minted token -
+# no secret on the device and no relay hop. This replaces the client secret on the DCR upload path;
+# leave the placeholder to keep using the classic client-secret upload. Requires SYSTEM/elevated (the
+# device cert key is TPM-bound). $BrokerClientId is the broker's inventory user-assigned managed
+# identity client id (deploy output 'inventoryIdentityClientId').
+$BrokerUrl = "<Enter Your Broker URL>"
+$BrokerClientId = "<Enter Your Broker Inventory Identity Client ID>"
 
 # Submission retry: on a rejected upload, wait, retry, and double the wait each time,
 # capping the wait at $SubmissionMaxWaitSeconds, up to $SubmissionMaxRetries before
@@ -1497,24 +1511,32 @@ Function Send-LogIngestionAPI(
 
     $payloadsize = ("Upload payload size is " + ($body.Length / 1024).ToString("#.#") + "Kb ")
 
-    # Secretless path: when an ingestion Function URL is configured, post through it.
-    # One call per inventory type. We do NOT combine types into one call: the limit is
-    # per DCR, and the Function makes the same per-stream DCR calls either way, so
-    # combining saves nothing and only adds complexity.
-    if ($FunctionUrl -and $FunctionUrl -notmatch '^<Enter') {
-        $rows = [System.Text.Encoding]::UTF8.GetString($body) | ConvertFrom-Json
-        $envelope = @{ submissions = @( @{ stream = "Custom-$logType"; rows = @($rows) } ) } | ConvertTo-Json -Depth 20 -Compress
-        $response = Invoke-LogSubmission -Uris @($FunctionUrl) -Body $envelope
-        if ($null -eq $response) { return "Function upload failed after retries : $payloadsize" }
-        # The Function returns 2xx on success and a non-2xx (retried above) on failure.
-        # Normalize success to the "204 :" the status report checks for.
-        return "204 : $payloadsize"
+    # Acquire the ingestion token. When $BrokerUrl is configured, this device authenticates to the
+    # PowerStacks Entra Token Broker with its Entra Join certificate (mutual TLS) and exchanges the
+    # returned assertion for the inventory managed identity's token - no secret on the device.
+    # Otherwise fall back to the classic client-secret token (New-BearerToken, unchanged). The DCR
+    # upload below is identical either way.
+    if ($BrokerUrl -and $BrokerUrl -notmatch '^<Enter') {
+        $cert = Get-ChildItem Cert:\LocalMachine\My |
+            Where-Object { $_.Issuer -match 'CN=MS-Organization-Access' } |
+            Sort-Object NotAfter -Descending | Select-Object -First 1
+        if (-not $cert -or -not $cert.HasPrivateKey) {
+            throw "Broker mode: no usable Entra Join certificate found (issuer CN=MS-Organization-Access). Run as SYSTEM/elevated on an Entra-joined device."
+        }
+        $assertion = (Invoke-RestMethod -Method "Post" -Uri ($BrokerUrl.TrimEnd('/') + "/token") -Certificate $cert -TimeoutSec 30).client_assertion
+        if (-not $assertion) { throw "Broker did not return a client_assertion." }
+        $tokScope = [System.Web.HttpUtility]::UrlEncode("https://monitor.azure.com//.default")
+        $tokBody  = "client_id=$BrokerClientId&scope=$tokScope&client_assertion_type=urn:ietf:params:oauth:client-assertion-type:jwt-bearer&client_assertion=$assertion&grant_type=client_credentials"
+        $tokUri   = "https://login.microsoftonline.com/$tenantId/oauth2/v2.0/token"
+        $bearerToken = (Invoke-RestMethod -Uri $tokUri -Method "Post" -Body $tokBody -Headers @{ "Content-Type" = "application/x-www-form-urlencoded" }).access_token
+    }
+    else {
+        $bearerToken = New-BearerToken -tenantId $tenantId -clientId $clientId -clientSecret $clientSecret
     }
 
-    # Classic path: mint a client-secret token and post straight to the DCR. Supports a
-    # pool of DCRs (scale-out): build one target URL per DCR id, and spread devices across
-    # the pool with a stable per-device start index so each DCR carries a roughly equal share.
-    $bearerToken = New-BearerToken -tenantId $tenantId -clientId $clientId -clientSecret $clientSecret
+    # Post straight to the DCR. Supports a pool of DCRs (scale-out): build one target URL per DCR id,
+    # and spread devices across the pool with a stable per-device start index so each DCR carries a
+    # roughly equal share.
     $uris = @(@($dcrImmutableId) | ForEach-Object { "$dceURI/dataCollectionRules/$_/streams/Custom-$logType" + "?api-version=2023-01-01" })
     $headers = @{ "Authorization" = "Bearer $bearerToken" }
 
@@ -2110,14 +2132,35 @@ if ($CollectAppInventory) {
     }
 
     Write-CMTraceLog "Translating user account to SID..."
+    $UserSid = $null
     try {
-        $AdObj = New-Object System.Security.Principal.NTAccount($CurrentLoggedOnUser)
+        $AdObj  = New-Object System.Security.Principal.NTAccount($CurrentLoggedOnUser)
         $strSID = $AdObj.Translate([System.Security.Principal.SecurityIdentifier])
         $UserSid = $strSID.Value
         Write-CMTraceLog "User SID: $UserSid"
     }
     catch {
-        Write-CMTraceLog "Error translating user to SID: $($_.Exception.Message)" -ErrorMsg
+        # IdentityNotMappedException: the account can't be resolved to a SID (orphaned/renamed/deleted
+        # account, a stale explorer.exe owner, or a name the local resolver doesn't know). This is not
+        # fatal - fall back to matching the user's profile folder in the registry, and if that also
+        # fails, continue with no user SID (Get-InstalledApplications then returns machine-scope apps
+        # only, since it always scans the HKLM uninstall keys).
+        Write-CMTraceLog "Could not translate '$CurrentLoggedOnUser' to a SID ($($_.Exception.Message)). Trying profile-list fallback..." -WarningMsg
+        try {
+            $userLeaf = ($CurrentLoggedOnUser -split '\\')[-1]
+            $UserSid = Get-CimInstance Win32_UserProfile -ErrorAction Stop |
+                Where-Object { -not $_.Special -and $_.LocalPath -and (Split-Path $_.LocalPath -Leaf) -ieq $userLeaf } |
+                Select-Object -First 1 -ExpandProperty SID
+            if ($UserSid) {
+                Write-CMTraceLog "Resolved user SID from profile list: $UserSid"
+            }
+            else {
+                Write-CMTraceLog "No matching user profile found; continuing without a user SID (machine-scope app inventory only)." -WarningMsg
+            }
+        }
+        catch {
+            Write-CMTraceLog "Profile-list SID fallback failed ($($_.Exception.Message)); continuing without a user SID." -WarningMsg
+        }
     }
 
     Write-CMTraceLog "Calling Get-InstalledApplications for Win32 apps..."
