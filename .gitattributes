@@ -1,0 +1,16 @@
+# Line-ending normalization for the Windows Custom Inventory repo.
+#
+# Without this, OneDrive and various editors rewrite CRLF<->LF on save and Git
+# reports whole files as "modified" even though no content changed. With these
+# rules Git stores a normalized LF blob and compares the working tree against
+# that normalized form, so end-of-line variations no longer produce diffs.
+
+# Auto-detect text vs binary; store all text normalized to LF in the repository.
+* text=auto
+
+# PowerShell scripts: check out with CRLF in the working tree (Windows / PS 5.1
+# convention; some 5.1 parsing and signing paths are happiest with CRLF).
+*.ps1 text eol=crlf
+
+# Markdown: LF.
+*.md  text eol=lf
