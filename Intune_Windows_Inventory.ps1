@@ -1098,6 +1098,70 @@ function Get-GetacWarranty(
     return $WarObj
 }
 
+# Function to acquire an HP Warranty API access token
+function Get-HPWarrantyToken {
+    <#
+.SYNOPSIS
+    Acquires an OAuth (client-credentials) access token for the HP Warranty API.
+.DESCRIPTION
+    Returns a fresh bearer token. Called for the initial request and again
+    whenever a long-running batch job outlives the current token and the API
+    rejects it with HTTP 401.
+.OUTPUTS
+    String access token.
+#>
+    $b64EncodedCred = [System.Convert]::ToBase64String([System.Text.Encoding]::ASCII.GetBytes("$WarrantyHPClientID`:$WarrantyHPClientSecret"))
+    $tokenHeaders = @{
+        accept        = "application/json"
+        authorization = "Basic $b64EncodedCred"
+    }
+    $authResponse = Invoke-WebRequest -UseBasicParsing -Method POST -Uri "https://warranty.api.hp.com/oauth/v1/token" -Headers $tokenHeaders -Body "grant_type=client_credentials" -ContentType "application/x-www-form-urlencoded"
+    return ($authResponse | ConvertFrom-Json).access_token
+}
+
+# Function to GET an HP Warranty API endpoint with automatic token refresh
+function Invoke-HPWarrantyGet {
+    <#
+.SYNOPSIS
+    Performs a GET against the HP Warranty API, refreshing the token on a 401.
+.DESCRIPTION
+    HP batch jobs can run longer than an access token stays valid. If the token
+    is rejected (HTTP 401) this requests a new one, updates the caller's token
+    (passed by [ref]) in place, and retries the request once.
+.PARAMETER Uri
+    The HP Warranty API URL to GET.
+.PARAMETER AccessToken
+    A [ref] to the caller's current access-token string, replaced in place when
+    the token is refreshed so the caller keeps using the new one.
+.PARAMETER SourceDevice
+    The serial number, for log context.
+.OUTPUTS
+    The Invoke-WebRequest response.
+#>
+    param(
+        [Parameter(Mandatory = $true)][string]$Uri,
+        [Parameter(Mandatory = $true)][ref]$AccessToken,
+        [Parameter(Mandatory = $true)][string]$SourceDevice
+    )
+
+    $headers = @{ accept = "application/json"; authorization = "Bearer $($AccessToken.Value)" }
+    try {
+        return Invoke-WebRequest -UseBasicParsing -Method GET -Uri $Uri -Headers $headers
+    }
+    catch {
+        $statusCode = $null
+        if ($_.Exception.Response) { try { $statusCode = [int]$_.Exception.Response.StatusCode } catch {} }
+
+        if ($statusCode -eq 401) {
+            Write-CMTraceLog "[$SourceDevice] HP token expired or invalid (401). Requesting a new token and retrying..."
+            $AccessToken.Value = Get-HPWarrantyToken
+            $headers = @{ accept = "application/json"; authorization = "Bearer $($AccessToken.Value)" }
+            return Invoke-WebRequest -UseBasicParsing -Method GET -Uri $Uri -Headers $headers
+        }
+        throw
+    }
+}
+
 # Function to get HP Warranty
 function Get-HPWarranty(
     <#
@@ -1114,50 +1178,60 @@ function Get-HPWarranty(
 
     try {
         Write-CMTraceLog "[$SourceDevice] Requesting HP warranty token..."
-        $b64EncodedCred = [System.Convert]::ToBase64String([System.Text.Encoding]::ASCII.GetBytes("$WarrantyHPClientID`:$WarrantyHPClientSecret"))
-        $tokenURI = "https://warranty.api.hp.com/oauth/v1/token"
-        $tokenHeaders = @{
-            accept        = "application/json"
-            authorization = "Basic $b64EncodedCred"
-        }
-        $tokenBody = "grant_type=client_credentials"
-
-        $authResponse = Invoke-WebRequest -UseBasicParsing -Method POST -Uri $tokenURI -Headers $tokenHeaders -Body $tokenBody -ContentType "application/x-www-form-urlencoded"
-        $accessToken = ($authResponse | ConvertFrom-Json).access_token
+        $accessToken = Get-HPWarrantyToken
         Write-CMTraceLog "[$SourceDevice] Successfully obtained access token."
 
         Write-CMTraceLog "[$SourceDevice] Submitting HP batch job..."
         $queryBody = "[{""sn"":""$SourceDevice""}]"
         $queryURI = "https://warranty.api.hp.com/productwarranty/v2/jobs"
-        $queryHeaders = @{
+        $submitHeaders = @{
             accept        = "application/json"
             authorization = "Bearer $accessToken"
         }
 
-        $jobResponse = Invoke-WebRequest -UseBasicParsing -Method POST -Uri $queryURI -Headers $queryHeaders -Body $queryBody -ContentType "application/json"
+        $jobResponse = Invoke-WebRequest -UseBasicParsing -Method POST -Uri $queryURI -Headers $submitHeaders -Body $queryBody -ContentType "application/json"
         $jobData = $jobResponse | ConvertFrom-Json
         $jobId = $jobData.jobId
         $estimatedTime = $jobData.estimatedTime
         Write-CMTraceLog "[$SourceDevice] Batch job created. Job ID: $jobId. Estimated time: $estimatedTime seconds."
 
-        Start-Sleep -Seconds $estimatedTime
-
         $JobStatusURI = "$queryURI/$jobId"
         $JobResultsURI = "$queryURI/$jobId/results"
 
+        # HP's API can take 5-10 minutes to finish when it is busy, longer than an
+        # access token stays valid. Cap the whole job at 12 minutes, and let
+        # Invoke-HPWarrantyGet request a fresh token and retry if the current one
+        # is rejected (HTTP 401) partway through polling.
+        $deadline = (Get-Date).AddMinutes(12)
+
+        # Wait the estimate before the first poll, but cap the initial nap so we
+        # start checking (and can refresh the token) on a sane cadence.
+        $initialWait = [Math]::Min([int]$estimatedTime, 60)
+        if ($initialWait -gt 0) { Start-Sleep -Seconds $initialWait }
+
         Write-CMTraceLog "[$SourceDevice] Polling job status..."
 
+        $status = "unknown"
         do {
-            $JobStatus = Invoke-WebRequest -UseBasicParsing -Method GET -Uri $JobStatusURI -Headers $queryHeaders | ConvertFrom-Json
-            Write-CMTraceLog "[$SourceDevice] Job status: $($JobStatus.status)"
-            if ($JobStatus.status -ne "completed") {
+            if ((Get-Date) -gt $deadline) {
+                throw "HP warranty job $jobId did not complete within 12 minutes (last status: $status)."
+            }
+
+            $JobStatus = Invoke-HPWarrantyGet -Uri $JobStatusURI -AccessToken ([ref]$accessToken) -SourceDevice $SourceDevice | ConvertFrom-Json
+            $status = $JobStatus.status
+            Write-CMTraceLog "[$SourceDevice] Job status: $status"
+
+            if ($status -eq "error" -or $status -eq "failed") {
+                throw "HP warranty job $jobId returned status '$status'."
+            }
+            if ($status -ne "completed") {
                 Start-Sleep -Seconds 15
             }
-        } while ($JobStatus.status -ne "completed")
+        } while ($status -ne "completed")
 
         Write-CMTraceLog "[$SourceDevice] Job completed. Retrieving results..."
 
-        $result = Invoke-WebRequest -UseBasicParsing -Method GET -Uri $JobResultsURI -Headers $queryHeaders | ConvertFrom-Json
+        $result = Invoke-HPWarrantyGet -Uri $JobResultsURI -AccessToken ([ref]$accessToken) -SourceDevice $SourceDevice | ConvertFrom-Json
 
         if (-not $result -or $result.Count -eq 0) {
             Write-CMTraceLog "[$SourceDevice] No data returned in results array."
