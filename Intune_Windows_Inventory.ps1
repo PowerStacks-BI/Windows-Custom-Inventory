@@ -109,6 +109,12 @@
   a user SID (machine-scope app inventory only) instead of throwing.
 - Use HTTPS instead of HTTP for the Lenovo warranty API endpoint.
 
+18 - July 23, 2026
+- HP warranty: refresh the access token on a 401 and cap the batch job at 12 minutes. HP's API can take
+  5 to 10 minutes to return when it is busy, which is longer than a token stays valid, so a long job no
+  longer fails on an expired token or hangs. Each status and results call requests a new token and retries
+  once if the current one is rejected, and the poll loop is bounded by a 12-minute deadline.
+
 ########### LEGAL DISCLAIMER ###########
     This script is provided "as is" without warranty of any kind, either express or implied. 
     Use at your own risk. Test thoroughly before deploying in production environments.
@@ -120,7 +126,7 @@
 [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
 
 # Current script version. ALWAYS UPDATE MANUALLY!
-$ScriptVersion = '17 - July 13, 2026'
+$ScriptVersion = '18 - July 23, 2026'
 
 
 # Current date/time
