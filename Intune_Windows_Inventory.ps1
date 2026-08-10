@@ -1,7 +1,7 @@
 <#
 .SYNOPSIS
     Comprehensive inventory and warranty collection script for Intune-managed Windows 10/11 devices.
-    Gathers hardware, software, driver, monitor, disk, battery, Microsoft 365, and warranty data, 
+    Gathers hardware, software, driver, monitor, disk, battery, Microsoft 365, and warranty data,
     then uploads results to Azure Log Analytics for centralized reporting.
 
 .DESCRIPTION
@@ -13,7 +13,7 @@
       - Installed and available drivers
       - Microsoft 365 update channel and compliance
       - Device warranty status for Dell, HP, Lenovo, and Getac (via vendor APIs)
-    Warranty lookups are cached locally to minimize API calls and can be forced to refresh as needed. 
+    Warranty lookups are cached locally to minimize API calls and can be forced to refresh as needed.
     All collected data is compressed, base64-encoded, and securely uploaded to Azure Log Analytics.
     The script is modular, allowing granular control over which inventory types are collected via variables.
 
@@ -75,7 +75,7 @@
 
 .NOTES
     Author: John Marcum (PJM)
-    Date: June 9, 2025
+    Date: August 10, 2026
     Contact: https://x.com/MEM_MVP
 
 .VERSION HISTORY
@@ -89,7 +89,7 @@
 - Fixed driver inventory bug with Get-Package provider
 - Added OS install date
 
-13 - January 6, 2026 
+13 - January 6, 2026
 - Modified to work with new log ingestion API
 
 14 - January 20, 2026
@@ -115,8 +115,12 @@
   longer fails on an expired token or hangs. Each status and results call requests a new token and retries
   once if the current one is rejected, and the poll loop is bounded by a 12-minute deadline.
 
+19 - August 10, 2026
+
+Bugfix in HP warranty
+
 ########### LEGAL DISCLAIMER ###########
-    This script is provided "as is" without warranty of any kind, either express or implied. 
+    This script is provided "as is" without warranty of any kind, either express or implied.
     Use at your own risk. Test thoroughly before deploying in production environments.
 #>
 
@@ -126,7 +130,7 @@
 [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
 
 # Current script version. ALWAYS UPDATE MANUALLY!
-$ScriptVersion = '18 - July 23, 2026'
+$ScriptVersion = '19 - August 10, 2026'
 
 
 # Current date/time
@@ -145,24 +149,22 @@ $LogAPIMode = "LogIngestionAPI"
 ########## Use for LogIngestionAPI #############
 
 # Replace with your Tenant ID in which the Data Collection Endpoint resides
-$TenantId = "<Enter Your Tenant ID>"
+$TenantId = "<ENTER YOUR TENANT ID HERE>"
 
 # Replace with your Client ID created and granted permissions
-$ClientId = "<Enter Your Client ID>"
+$ClientId = "<ENTER YOUR CLIENT ID HERE>"
 
 # Replace with your Secret created for the above Client
-$ClientSecret = "<Enter Your Client Secret>"
+$ClientSecret = "<ENTER YOUR CLIENT SECRET HERE>"
 
 # Replace with your Data Collection Endpoint - Log Ingestion URL
-$DceURI = "<Enter Your DCE Log Ingestion URL>"
+$DceURI = "<ENTER YOUR DATA COLLECTION ENDPOINT - LOG INGESTION URL HERE>"
 
-# Replace with your Data Collection Rule - Immutable ID. For high-volume fleets you can
-# scale out across multiple DCRs behind the same DCE (each DCR has its own ingestion
-# limit): set this to a list and the script spreads load across them, for example
-#   $DcrImmutableId = @("dcr-aaaa...", "dcr-bbbb...", "dcr-cccc...")
-$DcrImmutableId = "<Enter Your Dcr Immutable ID>"
+# Replace with your Data Collection Rule - Immutable ID
+$DcrImmutableId = "<ENTER YOUR DATA COLLECTION RULE - IMMUTABLE ID HERE>"
 
-# OPTIONAL secretless ingestion via the PowerStacks Entra Token Broker. When $BrokerUrl is set to a
+##### OPTIONAL ####
+#secretless ingestion via the PowerStacks Entra Token Broker. When $BrokerUrl is set to a
 # real URL, the device authenticates to the broker with its Entra Join certificate (mutual TLS),
 # receives a short-lived signed assertion, and posts straight to the DCR using a broker-minted token -
 # no secret on the device and no relay hop. This replaces the client secret on the DCR upload path;
@@ -206,14 +208,14 @@ $CollectWarranty = $false # Set to true to collect warranty data
 $CollectUWPInventory = $false # Set to true to collect UWP (modern app) inventory.
 
 #Warranty keys
-$WarrantyDellClientID = "<Enter Your Dell Client ID>"
-$WarrantyDellClientSecret = "<Enter Your Dell Client Secret"
-$WarrantyLenovoClientID = "<Enter Your Lenovo Client ID>"
-$WarrantyHPClientID = "<Enter Your HP Client ID>"
-$WarrantyHPClientSecret = "<Enter Your HP Client Secret>"  # Make note of expiration date!
+$WarrantyDellClientID = "<ENTER YOUR DELL WARRANTY CLIENT ID HERE>"
+$WarrantyDellClientSecret = "<ENTER YOUR DELL WARRANTY CLIENT SECRET HERE>"
+$WarrantyLenovoClientID = "<ENTER YOUR LENOVO WARRANTY CLIENT ID HERE>"
+$WarrantyHPClientID = "<ENTER YOUR HP WARRANTY CLIENT ID HERE>"
+$WarrantyHPClientSecret = "<ENTER YOUR HP WARRANTY CLIENT SECRET HERE>"  # Expires September 6, 2026
 
 # Warranty cache settings
-[int]$WarrantyMaxCacheAgeDays = 180 # The max age of the .json file which caches warranty data. 
+[int]$WarrantyMaxCacheAgeDays = 352 # The max age of the .json file which caches warranty data.
 [switch]$WarrantyForceRefresh = $false # Set to true to ignore the json and pull data from the API.
 
 # You can use an optional field to specify the timestamp from the data. If the time field is not specified, Azure Monitor assumes the time is the message ingestion time
@@ -229,16 +231,18 @@ $InventoryDateFormat = "MM-dd HH:mm"
 #endregion initialize
 
 # Start transcribing:
-if ($Transcribe){
-Write-Host 'Starting transcription'
-Start-Transcript -Path $logPath | Out-Null
+if ($Transcribe)
+{
+    Write-Host 'Starting transcription'
+    Start-Transcript -Path $logPath | Out-Null
 }
 
 
 #region functions
 
 # Function to write SCCM style logs
-function Write-CMTraceLog {
+function Write-CMTraceLog
+{
     <#
     .SYNOPSIS
       Write a CMTrace / SCCM-style log entry.
@@ -275,14 +279,17 @@ function Write-CMTraceLog {
         [Parameter(Position = 1)]
         [string] $Path = $script:CMLog,
 
-        [string] $Component = $(if ($PSCommandPath) {
-            [IO.Path]::GetFileName($PSCommandPath)
-        } else {
-            'PowerShell'
-        }),
+        [string] $Component = $(if ($PSCommandPath)
+            {
+                [IO.Path]::GetFileName($PSCommandPath)
+            }
+            else
+            {
+                'PowerShell'
+            }),
 
         [Parameter(ParameterSetName = 'ByType')]
-        [ValidateSet(1,2,3)]
+        [ValidateSet(1, 2, 3)]
         [int] $Type = 1,
 
         [Parameter(ParameterSetName = 'BySwitch')]
@@ -296,57 +303,96 @@ function Write-CMTraceLog {
     )
 
     # Resolve severity from switches
-    if ($PSCmdlet.ParameterSetName -eq 'BySwitch') {
-        if ($ErrorMsg)       { $Type = 3 }
-        elseif ($WarningMsg) { $Type = 2 }
-        else                 { $Type = 1 }
+    if ($PSCmdlet.ParameterSetName -eq 'BySwitch')
+    {
+        if ($ErrorMsg)
+        {
+            $Type = 3
+        }
+        elseif ($WarningMsg)
+        {
+            $Type = 2
+        }
+        else
+        {
+            $Type = 1
+        }
     }
 
     # ----- Write to console (clean) -----
-    switch ($Type) {
-        3 {
-            if ($EmitErrorRecord) {
+    switch ($Type)
+    {
+        3
+        {
+            if ($EmitErrorRecord)
+            {
                 Write-Error $Message
-            } else {
+            }
+            else
+            {
                 # Keep it highly visible but not a PowerShell error record
                 Write-Warning $Message
             }
         }
-        2 { Write-Warning $Message }
-        default { Write-Output $Message }
+        2
+        {
+            Write-Warning $Message
+        }
+        default
+        {
+            Write-Output $Message
+        }
     }
 
     # ----- Write to CMTrace log -----
-    try {
-        if ([string]::IsNullOrWhiteSpace($Path)) {
+    try
+    {
+        if ([string]::IsNullOrWhiteSpace($Path))
+        {
             throw "Log path is empty. `$logPath must be set before logging."
         }
 
         $dir = Split-Path -Path $Path -Parent
-        if ($dir -and -not (Test-Path -LiteralPath $dir)) {
+        if ($dir -and -not (Test-Path -LiteralPath $dir))
+        {
             New-Item -Path $dir -ItemType Directory -Force | Out-Null
         }
 
-        $now  = Get-Date
+        $now = Get-Date
         $time = $now.ToString('HH:mm:ss.fff')
         $date = $now.ToString('MM-dd-yyyy')
 
         $offsetMinutes = [int][TimeZoneInfo]::Local.GetUtcOffset($now).TotalMinutes
-        $bias = if ($offsetMinutes -ge 0) { "+$offsetMinutes" } else { "$offsetMinutes" }
+        $bias = if ($offsetMinutes -ge 0)
+        {
+            "+$offsetMinutes"
+        }
+        else
+        {
+            "$offsetMinutes"
+        }
 
-        $context = try { [System.Security.Principal.WindowsIdentity]::GetCurrent().Name } catch { '' }
-        $thread  = [System.Diagnostics.Process]::GetCurrentProcess().Id
+        $context = try
+        {
+            [System.Security.Principal.WindowsIdentity]::GetCurrent().Name
+        }
+        catch
+        {
+            ''
+        }
+        $thread = [System.Diagnostics.Process]::GetCurrentProcess().Id
 
         $safeMessage = $Message `
-            -replace '&','&amp;' `
-            -replace '<','&lt;' `
-            -replace '>','&gt;'
+            -replace '&', '&amp;' `
+            -replace '<', '&lt;' `
+            -replace '>', '&gt;'
 
         $line = "<![LOG[$safeMessage]LOG]!><time=""$time$bias"" date=""$date"" component=""$Component"" context=""$context"" type=""$Type"" thread=""$thread"" file="""">"
 
         Add-Content -LiteralPath $Path -Value $line -Encoding UTF8
     }
-    catch {
+    catch
+    {
         # If logging itself fails, *then* emit a real error record
         Write-Error "Write-CMTraceLog failed: $($_.Exception.Message)"
     }
@@ -354,7 +400,8 @@ function Write-CMTraceLog {
 
 
 # Function to get all Installed Application
-function Get-InstalledApplications() {
+function Get-InstalledApplications()
+{
     <#
 .SYNOPSIS
     Retrieves installed Win32 applications for a specified user.
@@ -371,18 +418,21 @@ function Get-InstalledApplications() {
 
     Write-CMTraceLog "Get-InstalledApplications: Starting for UserSid: $UserSid"
 
-    try {
+    try
+    {
         Write-CMTraceLog "Get-InstalledApplications: Mounting HKU registry hive..."
         New-PSDrive -PSProvider Registry -Name "HKU" -Root HKEY_USERS -ErrorAction Stop | Out-Null
         Write-CMTraceLog "Get-InstalledApplications: HKU registry hive mounted successfully"
     }
-    catch {
+    catch
+    {
         Write-CMTraceLog "Get-InstalledApplications: Error mounting HKU registry: $($_.Exception.Message)" -ErrorMsg
     }
 
     $regpath = @("HKLM:\Software\Microsoft\Windows\CurrentVersion\Uninstall\*")
     $regpath += "HKU:\$UserSid\Software\Microsoft\Windows\CurrentVersion\Uninstall\*"
-    if (-not ([IntPtr]::Size -eq 4)) {
+    if (-not ([IntPtr]::Size -eq 4))
+    {
         $regpath += "HKLM:\Software\Wow6432Node\Microsoft\Windows\CurrentVersion\Uninstall\*"
         $regpath += "HKU:\$UserSid\Software\Wow6432Node\Microsoft\Windows\CurrentVersion\Uninstall\*"
         Write-CMTraceLog "Get-InstalledApplications: 64-bit system detected, including Wow6432Node paths"
@@ -391,11 +441,19 @@ function Get-InstalledApplications() {
     Write-CMTraceLog "Get-InstalledApplications: Scanning $($regpath.Count) registry paths for installed applications..."
     $propertyNames = 'DisplayName', 'DisplayVersion', 'Publisher', 'UninstallString', 'InstallDate'
 
-    try {
-        $Apps = Get-ItemProperty $regpath -Name $propertyNames -ErrorAction SilentlyContinue | . { process { if ($_.DisplayName) { $_ } } } | Select-Object DisplayName, DisplayVersion, Publisher, UninstallString, InstallDate, PSPath | Sort-Object DisplayName
+    try
+    {
+        $Apps = Get-ItemProperty $regpath -Name $propertyNames -ErrorAction SilentlyContinue | . { process
+            {
+                if ($_.DisplayName)
+                {
+                    $_
+                }
+            } } | Select-Object DisplayName, DisplayVersion, Publisher, UninstallString, InstallDate, PSPath | Sort-Object DisplayName
         Write-CMTraceLog "Get-InstalledApplications: Found $($Apps.Count) installed applications"
     }
-    catch {
+    catch
+    {
         Write-CMTraceLog "Get-InstalledApplications: Error retrieving applications from registry: $($_.Exception.Message)" -ErrorMsg
         $Apps = @()
     }
@@ -403,40 +461,48 @@ function Get-InstalledApplications() {
     # Convert InstallDate string to DateTime and format as DD/MM/YYYY, handling empty InstallDate
     Write-CMTraceLog "Get-InstalledApplications: Processing install dates..."
     $dateProcessCount = 0
-    foreach ($app in $Apps) {
-        if (![string]::IsNullOrWhiteSpace($app.InstallDate)) {
+    foreach ($app in $Apps)
+    {
+        if (![string]::IsNullOrWhiteSpace($app.InstallDate))
+        {
             $parsedDate = [DateTime]::MinValue
-            if ([DateTime]::TryParseExact($app.InstallDate, 'yyyyMMdd', [System.Globalization.CultureInfo]::InvariantCulture, [System.Globalization.DateTimeStyles]::None, [ref]$parsedDate)) {
+            if ([DateTime]::TryParseExact($app.InstallDate, 'yyyyMMdd', [System.Globalization.CultureInfo]::InvariantCulture, [System.Globalization.DateTimeStyles]::None, [ref]$parsedDate))
+            {
                 $app.InstallDate = $parsedDate.ToString('dd-MM-yyyy')
                 $dateProcessCount++
             }
-            else {
+            else
+            {
                 # Date parsing failed, handle accordingly (e.g., set to null or a default value)
                 $app.InstallDate = $null
             }
         }
-        else {
+        else
+        {
             # Empty InstallDate string, handle accordingly (e.g., set to null or a default value)
             $app.InstallDate = $null
         }
     }
     Write-CMTraceLog "Get-InstalledApplications: Processed $dateProcessCount install dates"
 
-    try {
+    try
+    {
         Write-CMTraceLog "Get-InstalledApplications: Unmounting HKU registry hive..."
         Remove-PSDrive -Name "HKU" -ErrorAction Stop | Out-Null
         Write-CMTraceLog "Get-InstalledApplications: HKU registry hive unmounted successfully"
     }
-    catch {
+    catch
+    {
         Write-CMTraceLog "Get-InstalledApplications: Error unmounting HKU registry: $($_.Exception.Message)" -WarningMsg
     }
 
     Write-CMTraceLog "Get-InstalledApplications: Completed, returning $($Apps.Count) applications"
-    Return $Apps
+    return $Apps
 }
 
 # Function to get deduplicated Appx Installed Applications (UWP)
-Function Get-AppxInstalledApplications() {
+function Get-AppxInstalledApplications()
+{
     <#
 .SYNOPSIS
     Retrieves deduplicated list of installed UWP (AppX) applications for all users.
@@ -452,12 +518,14 @@ Function Get-AppxInstalledApplications() {
     # This is a known bug in 24H2.
     # Remove the fix once MS fixes the issue. Until this UWP app inventory may or may not work in 24H2
     Write-CMTraceLog "Get-AppxInstalledApplications: Applying Win11 24H2 compatibility fix..."
-    try {
+    try
+    {
         Add-Type -AssemblyName "System.EnterpriseServices"
         $publish = [System.EnterpriseServices.Internal.Publish]::new()
         Write-CMTraceLog "Get-AppxInstalledApplications: EnterpriseServices assembly loaded"
     }
-    catch {
+    catch
+    {
         Write-CMTraceLog "Get-AppxInstalledApplications: Error loading EnterpriseServices: $($_.Exception.Message)" -WarningMsg
     }
 
@@ -469,7 +537,8 @@ Function Get-AppxInstalledApplications() {
     )
 
     Write-CMTraceLog "Get-AppxInstalledApplications: Checking GAC for required DLLs..."
-    foreach ($dll in $dlls) {
+    foreach ($dll in $dlls)
+    {
         $dllPath = "$env:SystemRoot\\System32\\WindowsPowerShell\\v1.0\\$dll"
         $fileName = [System.IO.Path]::GetFileNameWithoutExtension($dll)
 
@@ -478,17 +547,21 @@ Function Get-AppxInstalledApplications() {
             $_.FullName -match [regex]::Escape($fileName)
         }
 
-        if (-not $existsInGAC) {
+        if (-not $existsInGAC)
+        {
             Write-CMTraceLog "Get-AppxInstalledApplications: $dll not found in GAC. Installing..."
-            try {
+            try
+            {
                 $publish.GacInstall($dllPath)
                 Write-CMTraceLog "Get-AppxInstalledApplications: $dll installed successfully"
             }
-            catch {
+            catch
+            {
                 Write-CMTraceLog "Get-AppxInstalledApplications: Error installing $dll - $($_.Exception.Message)" -WarningMsg
             }
         }
-        else {
+        else
+        {
             Write-CMTraceLog "Get-AppxInstalledApplications: $dll already exists in GAC"
         }
     }
@@ -497,16 +570,19 @@ Function Get-AppxInstalledApplications() {
 
     # Get the apps
     Write-CMTraceLog "Get-AppxInstalledApplications: Retrieving AppX packages for all users..."
-    try {
+    try
+    {
         $ErrorActionPreference = 'Stop'
         $appPackages = Get-AppxPackage -AllUsers
         Write-CMTraceLog "Get-AppxInstalledApplications: Retrieved $($appPackages.Count) AppX packages"
     }
-    catch {
+    catch
+    {
         Write-CMTraceLog "Get-AppxInstalledApplications: Failed to retrieve Appx packages: $($_.Exception.Message)" -WarningMsg
         $appPackages = @() # or $null if you prefer
     }
-    finally {
+    finally
+    {
         $ErrorActionPreference = 'Continue' # Reset to default if needed
     }
 
@@ -515,15 +591,19 @@ Function Get-AppxInstalledApplications() {
     # Process only the installed apps
     Write-CMTraceLog "Get-AppxInstalledApplications: Processing AppX packages..."
     $processedCount = 0
-    foreach ($pkg in $appPackages) {
-        if ($pkg.PackageUserInformation | Where-Object { $_.InstallState -eq 'Installed' }) {
+    foreach ($pkg in $appPackages)
+    {
+        if ($pkg.PackageUserInformation | Where-Object { $_.InstallState -eq 'Installed' })
+        {
             $processedCount++
             $publisher = $null
-            try {
+            try
+            {
                 $manifest = Get-AppxPackageManifest -Package $pkg.PackageFullName
                 $publisher = $manifest.Package.Properties.PublisherDisplayName
             }
-            catch {
+            catch
+            {
                 Write-CMTraceLog "Get-AppxInstalledApplications: Error getting manifest for $($pkg.Name): $($_.Exception.Message)" -WarningMsg
             }
 
@@ -546,7 +626,8 @@ Function Get-AppxInstalledApplications() {
 
 
 # Function to get Office update infomation
-function Get-Microsoft365 {
+function Get-Microsoft365
+{
     <#
 .SYNOPSIS
     Retrieves Microsoft 365 (Office Click-to-Run) update and compliance information.
@@ -556,16 +637,21 @@ function Get-Microsoft365 {
     PSCustomObject with Office version, channel, release, and support information.
 #>
     $IsC2R = Test-Path 'HKLM:\SOFTWARE\Microsoft\Office\ClickToRun'
-    if (-not $IsC2R) { Write-CMTraceLog "Not Click-to-Run Office"; return $null }
+    if (-not $IsC2R)
+    {
+        Write-CMTraceLog "Not Click-to-Run Office"; return $null
+    }
 
-    try {
+    try
+    {
         $ConfigPath = 'HKLM:\SOFTWARE\Microsoft\Office\ClickToRun\Configuration'
         $OfficeVersion = [version](Get-ItemProperty -Path $ConfigPath -ErrorAction Stop | Select-Object -ExpandProperty VersionToReport)
         $OfficeProductIds = (Get-ItemProperty -Path $ConfigPath -ErrorAction Stop | Select-Object -ExpandProperty ProductReleaseIds)
         $OfficeVersionString = $OfficeVersion.ToString()
         Write-CMTraceLog "Installed Version: $OfficeVersionString"
     }
-    catch {
+    catch
+    {
         Write-CMTraceLog "Failed to read Office configuration: $_"
         return $null
     }
@@ -583,20 +669,25 @@ function Get-Microsoft365 {
 
     $OfficeChannel = @{ Name = $null }
     $UpdateBranch = (Get-ItemProperty -Path 'HKLM:\SOFTWARE\Policies\Microsoft\Office\16.0\Common\OfficeUpdate' -ErrorAction SilentlyContinue).UpdateBranch
-    if ($UpdateBranch) {
+    if ($UpdateBranch)
+    {
         $OfficeChannel = $Channels | Where-Object { $_.GPO -eq $UpdateBranch }
         Write-CMTraceLog "Update channel from GPO: $($UpdateBranch): $($OfficeChannel.Name)"
     }
-    else {
+    else
+    {
         $CDNBaseUrl = (Get-ItemProperty -Path $ConfigPath -ErrorAction SilentlyContinue).CDNBaseUrl
-        if ($CDNBaseUrl) {
-            try {
+        if ($CDNBaseUrl)
+        {
+            try
+            {
                 $Uri = [System.Uri]$CDNBaseUrl
                 $Guid = $Uri.Segments[2].TrimEnd('/')
                 $OfficeChannel = $Channels | Where-Object { $_.GUID -eq $Guid }
                 Write-CMTraceLog "Update channel from CDN GUID: $Guid → $($OfficeChannel.Name)"
             }
-            catch {
+            catch
+            {
                 Write-CMTraceLog "Failed to parse CDNBaseUrl for channel"
             }
         }
@@ -611,15 +702,18 @@ function Get-Microsoft365 {
         'Beta'                  = 'Beta'
     }
 
-    if ($OfficeProductIds -like '*2019Volume*') {
+    if ($OfficeProductIds -like '*2019Volume*')
+    {
         $CDNChannel = 'LTSB'
         Write-CMTraceLog "Legacy Office 2019 detected"
     }
-    elseif ($OfficeProductIds -like '*2021Volume*') {
+    elseif ($OfficeProductIds -like '*2021Volume*')
+    {
         $CDNChannel = 'LTSB2021'
         Write-CMTraceLog "Legacy Office 2021 detected"
     }
-    else {
+    else
+    {
         $CDNChannel = $ChannelPathMap[$OfficeChannel.Name]
     }
 
@@ -634,13 +728,15 @@ function Get-Microsoft365 {
     $ReleaseID = $null
 
     Write-CMTraceLog "Get-Microsoft365: Querying C2R release data API..."
-    try {
+    try
+    {
         $C2RData = Invoke-RestMethod -Uri 'https://mrodevicemgr.officeapps.live.com/mrodevicemgrsvc/api/v2/C2RReleaseData' -Method GET -ErrorAction Stop
         Write-CMTraceLog "Get-Microsoft365: C2R API returned $($C2RData.Count) release entries"
         $ReleaseMatch = $C2RData | Where-Object { $_.availableBuild -eq $OfficeVersionString }
 
 
-        if (-not $ReleaseMatch) {
+        if (-not $ReleaseMatch)
+        {
             $ReleaseMatch = $C2RData |
                 Where-Object { $_.availableBuild -like "$($OfficeVersion.Major).$($OfficeVersion.Minor).*" } |
                 Sort-Object availableBuild -Descending |
@@ -649,23 +745,27 @@ function Get-Microsoft365 {
         }
 
         # If ReleaseMatch is an array, pick the first match
-        if ($ReleaseMatch -is [array]) {
+        if ($ReleaseMatch -is [array])
+        {
             Write-CMTraceLog "`n=== Raw C2R Match Array ==="
             $jsonOutput = $ReleaseMatch | ConvertTo-Json -Depth 5
             Write-CMTraceLog $jsonOutput
             Write-CMTraceLog "=== End Raw C2R Match Array ===`n"
 
-            if ($ReleaseMatch.Count -gt 0) {
+            if ($ReleaseMatch.Count -gt 0)
+            {
                 Write-CMTraceLog "Multiple matches found. Using first: $($ReleaseMatch[0].availableBuild)"
                 $ReleaseMatch = $ReleaseMatch[0]
             }
-            else {
+            else
+            {
                 Write-CMTraceLog "ReleaseMatch was empty array"
                 $ReleaseMatch = $null
             }
         }
 
-        if ($ReleaseMatch) {
+        if ($ReleaseMatch)
+        {
             Write-CMTraceLog "`n=== Raw Single C2R Match ==="
             $jsonOutput = $ReleaseMatch | ConvertTo-Json -Depth 5
             Write-CMTraceLog $jsonOutput
@@ -677,25 +777,31 @@ function Get-Microsoft365 {
             $ReleaseDate = "$($ReleaseMatch.updatedTimeUtc)"
             $ReleaseID = ($ReleaseMatch.forkName -split '-')[0]
 
-            if ($ReleaseMatch.endOfSupportDate -and $ReleaseMatch.endOfSupportDate -ne '0001-01-01T00:00:00Z') {
+            if ($ReleaseMatch.endOfSupportDate -and $ReleaseMatch.endOfSupportDate -ne '0001-01-01T00:00:00Z')
+            {
                 $EndOfSupportDate = "$($ReleaseMatch.endOfSupportDate)"
             }
-            else {
+            else
+            {
                 Write-CMTraceLog "EndOfSupportDate not found in C2R fallback needed"
             }
         }
-        else {
+        else
+        {
             Write-CMTraceLog "No C2R match found"
         }
     }
-    catch {
+    catch
+    {
         Write-CMTraceLog "C2R API failed: $_" -WarningMsg
     }
 
 
-    if ($CDNChannel) {
+    if ($CDNChannel)
+    {
         Write-CMTraceLog "Get-Microsoft365: Querying Office releases API for channel $CDNChannel..."
-        try {
+        try
+        {
             # The per-channel endpoint (releases/v1.0/LatestRelease/<channel>) was retired by Microsoft.
             # OfficeReleases returns every channel in one array; select ours and read the newest build.
             $CDNUrl = "https://clients.config.office.net/releases/v1.0/OfficeReleases"
@@ -707,34 +813,42 @@ function Get-Microsoft365 {
             } | Select-Object -First 1
             $CDNRel = $CDNChan.officeVersions | Select-Object -First 1
 
-            if ($CDNChan) {
-                if (-not $EndOfSupportDate -and $CDNRel.endOfSupportDate -and $CDNRel.endOfSupportDate -ne '0001-01-01T00:00:00Z') {
+            if ($CDNChan)
+            {
+                if (-not $EndOfSupportDate -and $CDNRel.endOfSupportDate -and $CDNRel.endOfSupportDate -ne '0001-01-01T00:00:00Z')
+                {
                     $EndOfSupportDate = $CDNRel.endOfSupportDate
                     Write-CMTraceLog "EndOfSupportDate pulled from CDN: $EndOfSupportDate"
                 }
-                if (-not $ReleaseDate -and $CDNRel.availabilityDate) {
+                if (-not $ReleaseDate -and $CDNRel.availabilityDate)
+                {
                     $ReleaseDate = $CDNRel.availabilityDate
                     Write-CMTraceLog "ReleaseDate pulled from CDN"
                 }
-                if (-not $LatestReleaseVersion -and $CDNChan.latestVersion) {
+                if (-not $LatestReleaseVersion -and $CDNChan.latestVersion)
+                {
                     $LatestReleaseVersion = $CDNChan.latestVersion
                     Write-CMTraceLog "ReleaseVersion pulled from CDN"
                 }
-                if (-not $ReleaseID -and $CDNRel.releaseVersion) {
+                if (-not $ReleaseID -and $CDNRel.releaseVersion)
+                {
                     $ReleaseID = $CDNRel.releaseVersion
                     Write-CMTraceLog "ReleaseID pulled from CDN"
                 }
             }
-            else {
+            else
+            {
                 Write-CMTraceLog "Get-Microsoft365: No matching channel '$CDNChannel' in OfficeReleases response" -WarningMsg
             }
         }
-        catch {
+        catch
+        {
             Write-CMTraceLog "Get-Microsoft365: CDN API failed: $_" -WarningMsg
             Write-Warning "CDN API failed: $_"
         }
     }
-    else {
+    else
+    {
         Write-CMTraceLog "Get-Microsoft365: CDN channel is null or empty, skipping CDN API call"
     }
 
@@ -756,118 +870,135 @@ function Get-Microsoft365 {
 Feel free to edit the query collect more or less drivers. - PJM
 #>
 # Function to get Installed Drivers
-function Get-InstalledDrivers() {
+function Get-InstalledDrivers()
+{
     Write-CMTraceLog "Get-InstalledDrivers: Starting driver inventory collection..."
 
     # Get PnP signed drivers
     Write-CMTraceLog "Get-InstalledDrivers: Retrieving PnP signed drivers from WMI..."
-    try {
+    try
+    {
         $PNPSigned_Drivers = Get-CimInstance -ClassName Win32_PnPSignedDriver -ErrorAction Stop | Where-Object {
             ($_.Manufacturer -ne "Microsoft") -and
             ($_.DriverProviderName -ne "Microsoft") -and
             ($_.DeviceName -ne $null)
-        } | Select-Object DeviceName,DriverVersion,DriverDate,DeviceClass,DeviceID,HardwareID,Manufacturer,InfName,Location,Description,DriverProviderName
+        } | Select-Object DeviceName, DriverVersion, DriverDate, DeviceClass, DeviceID, HardwareID, Manufacturer, InfName, Location, Description, DriverProviderName
         Write-CMTraceLog "Get-InstalledDrivers: Retrieved $($PNPSigned_Drivers.Count) PnP signed drivers (non-Microsoft)"
     }
-    catch {
+    catch
+    {
         Write-CMTraceLog "Get-InstalledDrivers: Error retrieving PnP signed drivers: $($_.Exception.Message)" -ErrorMsg
         $PNPSigned_Drivers = @()
     }
 
-    if ($MatchDrivers){
-    # Get installed MSU packages
-    Write-CMTraceLog "Get-InstalledDrivers: Retrieving installed MSU driver packages..."
-    try {
-        $InstalledDrivers = Get-Package -ProviderName msu -ErrorAction Stop | Where-Object {
-            $_.Metadata.Item("SupportUrl") -match "target=hub"
-        }
-        Write-CMTraceLog "Get-InstalledDrivers: Retrieved $($InstalledDrivers.Count) installed MSU driver packages"
-    }
-    catch {
-        Write-CMTraceLog "Get-InstalledDrivers: Error retrieving MSU packages: $($_.Exception.Message)" -WarningMsg
-        $InstalledDrivers = @()
-    }
-
-    # Get optional updates
-    Write-CMTraceLog "Get-InstalledDrivers: Searching for optional driver updates via Windows Update..."
-    try {
-        $updateSession = New-Object -ComObject Microsoft.Update.Session
-        $updateSearcher = $updateSession.CreateUpdateSearcher()
-        Write-CMTraceLog "Get-InstalledDrivers: Windows Update session created, searching for uninstalled drivers..."
-        $searchResult = $updateSearcher.Search("IsInstalled=0 AND Type='Driver'")
-        Write-CMTraceLog "Get-InstalledDrivers: Windows Update search completed, found $($searchResult.Updates.Count) optional drivers"
-    }
-    catch {
-        Write-CMTraceLog "Get-InstalledDrivers: Error searching Windows Update for optional drivers: $($_.Exception.Message)" -WarningMsg
-        $searchResult = $null
-    }
-    $OptionalWUList = @()
-    If($searchResult -and $searchResult.Updates.Count -gt 0) {
-        Write-CMTraceLog "Get-InstalledDrivers: Processing $($searchResult.Updates.Count) optional driver updates..."
-        For($i = 0; $i -lt $searchResult.Updates.Count; $i++) {
-            $update = $searchResult.Updates.Item($i)
-            $OptionalWUList += [PSCustomObject]@{
-                WUName                 = $update.Title
-                DriverName             = $update.DriverModel
-                DriverVersion          = $null
-                DriverReleaseDate      = if ($update.DriverVerDate){
-                $update.DriverVerDate.ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ss.fffffffZ")
-                }
-                else {
-                    $null
-                }
-                DriverClass            = $update.DriverClass.ToUpper()
-                DriverID               = $null
-                DriverHardwareID       = $update.DriverHardwareID
-                DriverManufacturer     = $update.DriverManufacturer
-                DriverInfName          = $null
-                DriverLocation         = $null
-                DriverDescription      = $update.Description
-                DriverProvider         = $update.DriverProvider
-                DriverPublishedOn      = $update.LastDeploymentChangeTime.ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ss.fffffffZ")
-                DriverStatus           = "Optional"
+    if ($MatchDrivers)
+    {
+        # Get installed MSU packages
+        Write-CMTraceLog "Get-InstalledDrivers: Retrieving installed MSU driver packages..."
+        try
+        {
+            $InstalledDrivers = Get-Package -ProviderName msu -ErrorAction Stop | Where-Object {
+                $_.Metadata.Item("SupportUrl") -match "target=hub"
             }
+            Write-CMTraceLog "Get-InstalledDrivers: Retrieved $($InstalledDrivers.Count) installed MSU driver packages"
         }
-        Write-CMTraceLog "Get-InstalledDrivers: Created $($OptionalWUList.Count) optional driver entries"
-    }
-    else {
-        Write-CMTraceLog "Get-InstalledDrivers: No optional driver updates found"
-    }
+        catch
+        {
+            Write-CMTraceLog "Get-InstalledDrivers: Error retrieving MSU packages: $($_.Exception.Message)" -WarningMsg
+            $InstalledDrivers = @()
+        }
 
-    # Link installed drivers
-    Write-CMTraceLog "Get-InstalledDrivers: Linking installed MSU packages with PnP drivers..."
-    $LinkedDrivers = foreach ($installedDriver in $InstalledDrivers) {
-        $versionFromName = $installedDriver.Name.Split()[-1]
-        $matchingDriver = $PNPSigned_Drivers | Where-Object {
-            $_.DriverVersion -eq $versionFromName
-        } | Select-Object -First 1
-
-        if ($matchingDriver) {
-            [PSCustomObject]@{
-                WUName                 = $installedDriver.Name
-                DriverName             = $matchingDriver.DeviceName
-                DriverVersion          = $matchingDriver.DriverVersion             
-                DriverReleaseDate      = if ($matchingDriver.DriverDate){
-                    $matchingDriver.DriverDate.ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ss.fffffffZ")
+        # Get optional updates
+        Write-CMTraceLog "Get-InstalledDrivers: Searching for optional driver updates via Windows Update..."
+        try
+        {
+            $updateSession = New-Object -ComObject Microsoft.Update.Session
+            $updateSearcher = $updateSession.CreateUpdateSearcher()
+            Write-CMTraceLog "Get-InstalledDrivers: Windows Update session created, searching for uninstalled drivers..."
+            $searchResult = $updateSearcher.Search("IsInstalled=0 AND Type='Driver'")
+            Write-CMTraceLog "Get-InstalledDrivers: Windows Update search completed, found $($searchResult.Updates.Count) optional drivers"
+        }
+        catch
+        {
+            Write-CMTraceLog "Get-InstalledDrivers: Error searching Windows Update for optional drivers: $($_.Exception.Message)" -WarningMsg
+            $searchResult = $null
+        }
+        $OptionalWUList = @()
+        if ($searchResult -and $searchResult.Updates.Count -gt 0)
+        {
+            Write-CMTraceLog "Get-InstalledDrivers: Processing $($searchResult.Updates.Count) optional driver updates..."
+            for ($i = 0; $i -lt $searchResult.Updates.Count; $i++)
+            {
+                $update = $searchResult.Updates.Item($i)
+                $OptionalWUList += [PSCustomObject]@{
+                    WUName             = $update.Title
+                    DriverName         = $update.DriverModel
+                    DriverVersion      = $null
+                    DriverReleaseDate  = if ($update.DriverVerDate)
+                    {
+                        $update.DriverVerDate.ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ss.fffffffZ")
                     }
-                    else {
+                    else
+                    {
                         $null
                     }
-                DriverClass            = $matchingDriver.DeviceClass
-                DriverID               = $matchingDriver.DeviceID
-                DriverHardwareID       = $matchingDriver.HardwareID
-                DriverManufacturer     = $matchingDriver.Manufacturer
-                DriverInfName          = $matchingDriver.InfName
-                DriverLocation         = $matchingDriver.Location
-                DriverDescription      = $matchingDriver.Description
-                DriverProvider         = $matchingDriver.DriverProviderName
-                DriverPublishedOn      = $null
-                DriverStatus           = "Installed"
+                    DriverClass        = $update.DriverClass.ToUpper()
+                    DriverID           = $null
+                    DriverHardwareID   = $update.DriverHardwareID
+                    DriverManufacturer = $update.DriverManufacturer
+                    DriverInfName      = $null
+                    DriverLocation     = $null
+                    DriverDescription  = $update.Description
+                    DriverProvider     = $update.DriverProvider
+                    DriverPublishedOn  = $update.LastDeploymentChangeTime.ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ss.fffffffZ")
+                    DriverStatus       = "Optional"
+                }
+            }
+            Write-CMTraceLog "Get-InstalledDrivers: Created $($OptionalWUList.Count) optional driver entries"
+        }
+        else
+        {
+            Write-CMTraceLog "Get-InstalledDrivers: No optional driver updates found"
+        }
+
+        # Link installed drivers
+        Write-CMTraceLog "Get-InstalledDrivers: Linking installed MSU packages with PnP drivers..."
+        $LinkedDrivers = foreach ($installedDriver in $InstalledDrivers)
+        {
+            $versionFromName = $installedDriver.Name.Split()[-1]
+            $matchingDriver = $PNPSigned_Drivers | Where-Object {
+                $_.DriverVersion -eq $versionFromName
+            } | Select-Object -First 1
+
+            if ($matchingDriver)
+            {
+                [PSCustomObject]@{
+                    WUName             = $installedDriver.Name
+                    DriverName         = $matchingDriver.DeviceName
+                    DriverVersion      = $matchingDriver.DriverVersion
+                    DriverReleaseDate  = if ($matchingDriver.DriverDate)
+                    {
+                        $matchingDriver.DriverDate.ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ss.fffffffZ")
+                    }
+                    else
+                    {
+                        $null
+                    }
+                    DriverClass        = $matchingDriver.DeviceClass
+                    DriverID           = $matchingDriver.DeviceID
+                    DriverHardwareID   = $matchingDriver.HardwareID
+                    DriverManufacturer = $matchingDriver.Manufacturer
+                    DriverInfName      = $matchingDriver.InfName
+                    DriverLocation     = $matchingDriver.Location
+                    DriverDescription  = $matchingDriver.Description
+                    DriverProvider     = $matchingDriver.DriverProviderName
+                    DriverPublishedOn  = $null
+                    DriverStatus       = "Installed"
+                }
             }
         }
+        Write-CMTraceLog "Get-InstalledDrivers: Linked $($LinkedDrivers.Count) MSU packages to PnP drivers"
     }
-    Write-CMTraceLog "Get-InstalledDrivers: Linked $($LinkedDrivers.Count) MSU packages to PnP drivers"
-}
 
     # Add unmatched installed drivers
     Write-CMTraceLog "Get-InstalledDrivers: Finding unmatched PnP drivers..."
@@ -879,27 +1010,30 @@ function Get-InstalledDrivers() {
     Write-CMTraceLog "Get-InstalledDrivers: Combining linked and unmatched drivers..."
     $LinkedDrivers = @(
         $LinkedDrivers  # Include existing linked drivers
-        foreach ($driver in $unmatchedDrivers) {
+        foreach ($driver in $unmatchedDrivers)
+        {
             [PSCustomObject]@{
-                WUName                 = $null
-                DriverName             = $driver.DeviceName
-                DriverVersion          = $driver.DriverVersion
-                DriverReleaseDate  = if ($driver.DriverDate) {
+                WUName             = $null
+                DriverName         = $driver.DeviceName
+                DriverVersion      = $driver.DriverVersion
+                DriverReleaseDate  = if ($driver.DriverDate)
+                {
                     $driver.DriverDate.ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ss.fffffffZ")
                 }
-                else {
+                else
+                {
                     $null
                 }
-                DriverClass            = $driver.DeviceClass
-                DriverID               = $driver.DeviceID
-                DriverHardwareID       = $driver.HardwareID
-                DriverManufacturer     = $driver.Manufacturer
-                DriverInfName          = $driver.InfName
-                DriverLocation         = $driver.Location
-                DriverDescription      = $driver.Description
-                DriverProvider         = $driver.DriverProviderName
-                DriverPublishedOn      = $null
-                DriverStatus           = "Installed"
+                DriverClass        = $driver.DeviceClass
+                DriverID           = $driver.DeviceID
+                DriverHardwareID   = $driver.HardwareID
+                DriverManufacturer = $driver.Manufacturer
+                DriverInfName      = $driver.InfName
+                DriverLocation     = $driver.Location
+                DriverDescription  = $driver.Description
+                DriverProvider     = $driver.DriverProviderName
+                DriverPublishedOn  = $null
+                DriverStatus       = "Installed"
             }
         }
     )
@@ -907,27 +1041,28 @@ function Get-InstalledDrivers() {
 
     # Add optional updates to the list
     Write-CMTraceLog "Get-InstalledDrivers: Adding optional driver updates to final list..."
-    foreach ($optionalDriver in $OptionalWUList) {
+    foreach ($optionalDriver in $OptionalWUList)
+    {
         $LinkedDrivers += [PSCustomObject]@{
-            WUName                 = $optionalDriver.WUName
-            DriverName             = $optionalDriver.DriverName
-            DriverVersion          = $optionalDriver.DriverVersion
-            DriverReleaseDate      = $optionalDriver.DriverDate
-            DriverClass            = $optionalDriver.DeviceClass
-            DriverID               = $optionalDriver.DeviceID
-            DriverHardwareID       = $optionalDriver.DriverHardwareID
-            DriverManufacturer     = $optionalDriver.Manufacturer
-            DriverInfName          = $optionalDriver.InfName
-            DriverLocation         = $optionalDriver.Location
-            DriverDescription      = $optionalDriver.Description
-            DriverProvider         = $optionalDriver.DriverProvider
-            DriverPublishedOn      = $optionalDriver.DriverChangeTime
-            DriverStatus           = $optionalDriver.DriverStatus
+            WUName             = $optionalDriver.WUName
+            DriverName         = $optionalDriver.DriverName
+            DriverVersion      = $optionalDriver.DriverVersion
+            DriverReleaseDate  = $optionalDriver.DriverDate
+            DriverClass        = $optionalDriver.DeviceClass
+            DriverID           = $optionalDriver.DeviceID
+            DriverHardwareID   = $optionalDriver.DriverHardwareID
+            DriverManufacturer = $optionalDriver.Manufacturer
+            DriverInfName      = $optionalDriver.InfName
+            DriverLocation     = $optionalDriver.Location
+            DriverDescription  = $optionalDriver.Description
+            DriverProvider     = $optionalDriver.DriverProvider
+            DriverPublishedOn  = $optionalDriver.DriverChangeTime
+            DriverStatus       = $optionalDriver.DriverStatus
         }
     }
 
     Write-CMTraceLog "Get-InstalledDrivers: Completed, returning $($LinkedDrivers.Count) total driver entries"
-    Return $LinkedDrivers
+    return $LinkedDrivers
 }
 
 
@@ -942,18 +1077,22 @@ function Get-DellWarranty(
     The Dell service tag (serial number) of the device.
 .OUTPUTS
     PSCustomObject with Dell warranty details.
-#>    
-    [Parameter(Mandatory = $true)]$SourceDevice) {
+#>
+    [Parameter(Mandatory = $true)]$SourceDevice)
+{
     $AuthURI = "https://apigtwb2c.us.dell.com/auth/oauth/v2/token"
 
-    try {
+    try
+    {
         Write-CMTraceLog "[$SourceDevice] Checking Dell OAuth token validity..."
-        if ($Global:TokenAge -lt (Get-Date).AddMinutes(-55)) {
+        if ($Global:TokenAge -lt (Get-Date).AddMinutes(-55))
+        {
             Write-CMTraceLog "[$SourceDevice] Token expired or missing. Clearing existing token..."
             $global:Token = $null
         }
 
-        if ($null -eq $global:Token) {
+        if ($null -eq $global:Token)
+        {
             Write-CMTraceLog "[$SourceDevice] Requesting new Dell OAuth token..."
             $OAuth = "$WarrantyDellClientID`:$WarrantyDellClientSecret"
             $Bytes = [System.Text.Encoding]::ASCII.GetBytes($OAuth)
@@ -961,13 +1100,15 @@ function Get-DellWarranty(
             $headersAuth = @{ "authorization" = "Basic $EncodedOAuth" }
             $Authbody = 'grant_type=client_credentials'
 
-            try {
-                $AuthResult = Invoke-RESTMethod -Method Post -Uri $AuthURI -Body $AuthBody -Headers $HeadersAuth -ErrorAction Stop
+            try
+            {
+                $AuthResult = Invoke-RestMethod -Method Post -Uri $AuthURI -Body $AuthBody -Headers $HeadersAuth -ErrorAction Stop
                 $global:token = $AuthResult.access_token
                 $Global:TokenAge = Get-Date
                 Write-CMTraceLog "[$SourceDevice] Dell token acquired successfully."
             }
-            catch {
+            catch
+            {
                 Write-CMTraceLog "[$SourceDevice] Error acquiring Dell OAuth token: $($_.Exception.Message)" -ErrorMsg
                 throw
             }
@@ -977,15 +1118,18 @@ function Get-DellWarranty(
         $headersReq = @{ "Authorization" = "Bearer $global:Token" }
         $ReqBody = @{ servicetags = $SourceDevice }
 
-        try {
+        try
+        {
             $WarReq = Invoke-RestMethod -Uri "https://apigtwb2c.us.dell.com/PROD/sbil/eapi/v5/asset-entitlements" -Headers $headersReq -Body $ReqBody -Method Get -ContentType "application/json" -ErrorAction Stop
         }
-        catch {
+        catch
+        {
             Write-CMTraceLog "[$SourceDevice] Error calling Dell warranty API: $($_.Exception.Message)" -ErrorMsg
             throw
         }
 
-        if ($WarReq.entitlements.serviceleveldescription) {
+        if ($WarReq.entitlements.serviceleveldescription)
+        {
             Write-CMTraceLog "[$SourceDevice] Warranty data received from Dell."
 
             $WarObj = [PSCustomObject]@{
@@ -997,7 +1141,8 @@ function Get-DellWarranty(
                 'WarrantyEndDate'         = ($WarReq.entitlements.enddate | Sort-Object | Select-Object -Last 1)
             }
         }
-        else {
+        else
+        {
             Write-CMTraceLog "[$SourceDevice] No service level description returned by Dell."
             $WarObj = [PSCustomObject]@{
                 'ServiceProvider'         = 'Dell'
@@ -1009,7 +1154,8 @@ function Get-DellWarranty(
             }
         }
     }
-    catch {
+    catch
+    {
         Write-CMTraceLog "[$SourceDevice] ERROR during Dell warranty lookup: $($_.Exception.Message)"
         $WarObj = [PSCustomObject]@{
             'ServiceProvider'         = 'Dell'
@@ -1037,24 +1183,27 @@ function Get-LenovoWarranty(
     The Lenovo serial number of the device.
 .OUTPUTS
     PSCustomObject with Lenovo warranty details.
-#>    
-    [Parameter(Mandatory = $true)]$SourceDevice) {
+#>
+    [Parameter(Mandatory = $true)]$SourceDevice)
+{
     $headersReq = @{ "ClientID" = $WarrantyLenovoClientID }
     $WarReq = Invoke-RestMethod -Uri "https://supportapi.lenovo.com/V2.5/Warranty?Serial=$SourceDevice" -Headers $headersReq -Method Get -ContentType "application/json"
-    
-    try {
+
+    try
+    {
         $Warlist = $WarReq.Warranty | Where-Object { ($_.ID -eq "36Y") -or ($_.ID -eq "3EZ") -or ($_.ID -eq "12B") -or ($_.ID -eq "1EZ") }
         $WarObj = [PSCustomObject]@{
             'ServiceProvider'         = 'Lenovo'
             'ServiceModel'            = $WarReq.Product
             'ServiceTag'              = $SourceDevice
             'ServiceLevelDescription' = $Warlist.Name -join "`n"
-            'WarrantyStartDate'       = ($Warlist.Start | sort-object -Descending | select-object -last 1)
-            'WarrantyEndDate'         = ($Warlist.End | sort-object | select-object -last 1)
+            'WarrantyStartDate'       = ($Warlist.Start | Sort-Object -Descending | Select-Object -Last 1)
+            'WarrantyEndDate'         = ($Warlist.End | Sort-Object | Select-Object -Last 1)
         }
 
     }
-    catch {
+    catch
+    {
         $WarObj = [PSCustomObject]@{
             'ServiceProvider'         = 'Lenovo'
             'ServiceModel'            = $null
@@ -1064,7 +1213,7 @@ function Get-LenovoWarranty(
             'WarrantyEndDate'         = $null
         }
     }
-    return $WarObj  
+    return $WarObj
 }
 
 # Function to get Getac Warranty
@@ -1079,19 +1228,22 @@ function Get-GetacWarranty(
 .OUTPUTS
     PSCustomObject with Getac warranty details.
 #>
-    [Parameter(Mandatory = $true)]$SourceDevice) {
+    [Parameter(Mandatory = $true)]$SourceDevice)
+{
     $WarReq = Invoke-RestMethod -Uri https://api.getac.us/rma-manager/rma/verify-serial?serial=$SerialNumber -Method Get -ContentType "application/json"
-    try {
+    try
+    {
         $WarObj = [PSCustomObject]@{
             'ServiceProvider'         = 'Getac'
             'ServiceModel'            = $WarReq.model
             'ServiceTag'              = $SourceDevice
             'ServiceLevelDescription' = $WarReq.warrantyType
             'WarrantyStartDate'       = $null
-            'WarrantyEndDate'         = ($warreq.endDeviceWarranty | sort-object | select-object -last 1)
+            'WarrantyEndDate'         = ($warreq.endDeviceWarranty | Sort-Object | Select-Object -Last 1)
         }
     }
-    catch {
+    catch
+    {
         $WarObj = [PSCustomObject]@{
             'ServiceProvider'         = 'Getac'
             'ServiceModel'            = $null
@@ -1105,7 +1257,8 @@ function Get-GetacWarranty(
 }
 
 # Function to acquire an HP Warranty API access token
-function Get-HPWarrantyToken {
+function Get-HPWarrantyToken
+{
     <#
 .SYNOPSIS
     Acquires an OAuth (client-credentials) access token for the HP Warranty API.
@@ -1126,7 +1279,8 @@ function Get-HPWarrantyToken {
 }
 
 # Function to GET an HP Warranty API endpoint with automatic token refresh
-function Invoke-HPWarrantyGet {
+function Invoke-HPWarrantyGet
+{
     <#
 .SYNOPSIS
     Performs a GET against the HP Warranty API, refreshing the token on a 401.
@@ -1151,14 +1305,26 @@ function Invoke-HPWarrantyGet {
     )
 
     $headers = @{ accept = "application/json"; authorization = "Bearer $($AccessToken.Value)" }
-    try {
+    try
+    {
         return Invoke-WebRequest -UseBasicParsing -Method GET -Uri $Uri -Headers $headers
     }
-    catch {
+    catch
+    {
         $statusCode = $null
-        if ($_.Exception.Response) { try { $statusCode = [int]$_.Exception.Response.StatusCode } catch {} }
+        if ($_.Exception.Response)
+        {
+            try
+            {
+                $statusCode = [int]$_.Exception.Response.StatusCode
+            }
+            catch
+            {
+            }
+        }
 
-        if ($statusCode -eq 401) {
+        if ($statusCode -eq 401)
+        {
             Write-CMTraceLog "[$SourceDevice] HP token expired or invalid (401). Requesting a new token and retrying..."
             $AccessToken.Value = Get-HPWarrantyToken
             $headers = @{ accept = "application/json"; authorization = "Bearer $($AccessToken.Value)" }
@@ -1180,9 +1346,11 @@ function Get-HPWarranty(
 .OUTPUTS
     PSCustomObject with HP warranty details.
 #>
-    [Parameter(Mandatory = $true)]$SourceDevice) {
+    [Parameter(Mandatory = $true)]$SourceDevice)
+{
 
-    try {
+    try
+    {
         Write-CMTraceLog "[$SourceDevice] Requesting HP warranty token..."
         $accessToken = Get-HPWarrantyToken
         Write-CMTraceLog "[$SourceDevice] Successfully obtained access token."
@@ -1213,13 +1381,18 @@ function Get-HPWarranty(
         # Wait the estimate before the first poll, but cap the initial nap so we
         # start checking (and can refresh the token) on a sane cadence.
         $initialWait = [Math]::Min([int]$estimatedTime, 60)
-        if ($initialWait -gt 0) { Start-Sleep -Seconds $initialWait }
+        if ($initialWait -gt 0)
+        {
+            Start-Sleep -Seconds $initialWait
+        }
 
         Write-CMTraceLog "[$SourceDevice] Polling job status..."
 
         $status = "unknown"
-        do {
-            if ((Get-Date) -gt $deadline) {
+        do
+        {
+            if ((Get-Date) -gt $deadline)
+            {
                 throw "HP warranty job $jobId did not complete within 12 minutes (last status: $status)."
             }
 
@@ -1227,28 +1400,46 @@ function Get-HPWarranty(
             $status = $JobStatus.status
             Write-CMTraceLog "[$SourceDevice] Job status: $status"
 
-            if ($status -eq "error" -or $status -eq "failed") {
+            if ($status -eq "error" -or $status -eq "failed")
+            {
                 throw "HP warranty job $jobId returned status '$status'."
             }
-            if ($status -ne "completed") {
+            if ($status -ne "completed")
+            {
                 Start-Sleep -Seconds 15
             }
         } while ($status -ne "completed")
 
         Write-CMTraceLog "[$SourceDevice] Job completed. Retrieving results..."
 
-        $result = Invoke-HPWarrantyGet -Uri $JobResultsURI -AccessToken ([ref]$accessToken) -SourceDevice $SourceDevice | ConvertFrom-Json
+        $rawResults = (Invoke-HPWarrantyGet -Uri $JobResultsURI -AccessToken ([ref]$accessToken) -SourceDevice $SourceDevice).Content
 
-        if (-not $result -or $result.Count -eq 0) {
+        # Diagnostic copy of the raw HP payload. Out-File consumes the pipeline, so this
+        # does not leak into the function's return value the way a bare expression would.
+        $rawResults | Out-File -FilePath "C:\Windows\Temp\HPWarranty_Raw_$SourceDevice.json" -Encoding UTF8
+
+        # Force an array. PowerShell 5.1 ConvertFrom-Json unrolls a JSON root array,
+        # so a single-serial job returns a bare PSCustomObject and $result[0] is null.
+        $result = @($rawResults | ConvertFrom-Json)
+
+        if ($result.Count -eq 0)
+        {
             Write-CMTraceLog "[$SourceDevice] No data returned in results array."
             throw "Empty results"
         }
 
-        $deviceData = $result[0]  # root array
+        $deviceData = $result[0]
+
+        # HP returns an error node per serial rather than failing the job. Surface it.
+        if ($deviceData.error)
+        {
+            Write-CMTraceLog "[$SourceDevice] HP returned an error for this serial: $($deviceData.error | ConvertTo-Json -Compress)"
+        }
         $product = $deviceData.product
         $offers = $deviceData.offers
 
-        if ($offers) {
+        if ($offers)
+        {
             Write-CMTraceLog "[$SourceDevice] Warranty data retrieved successfully."
 
             $serviceDescriptions = $offers | ForEach-Object {
@@ -1267,7 +1458,8 @@ function Get-HPWarranty(
                 'WarrantyEndDate'         = $endDate
             }
         }
-        else {
+        else
+        {
             Write-CMTraceLog "[$SourceDevice] No offers found in response."
             $WarObj = [PSCustomObject]@{
                 'ServiceProvider'         = 'HP'
@@ -1279,7 +1471,8 @@ function Get-HPWarranty(
             }
         }
     }
-    catch {
+    catch
+    {
         Write-CMTraceLog "[$SourceDevice] ERROR during HP warranty lookup: $($_.Exception.Message)"
         $WarObj = [PSCustomObject]@{
             'ServiceProvider'         = 'HP'
@@ -1296,7 +1489,8 @@ function Get-HPWarranty(
 
 
 # Unified Warranty Retriever
-function Get-Warranty {
+function Get-Warranty
+{
     <#
 .SYNOPSIS
     Retrieves and caches warranty information for a device from the appropriate vendor API.
@@ -1314,10 +1508,13 @@ function Get-Warranty {
         [Parameter(Mandatory = $true)][string]$Manufacturer
     )
     $CachePath = "C:\Windows\Warranty_$SerialNumber.json"
-    try {
-        if (-not $WarrantyForceRefresh -and (Test-Path $CachePath)) {
+    try
+    {
+        if (-not $WarrantyForceRefresh -and (Test-Path $CachePath))
+        {
             $fileAge = (Get-Date) - (Get-Item $CachePath).LastWriteTime
-            if ($fileAge.TotalDays -le $WarrantyMaxCacheAgeDays) {
+            if ($fileAge.TotalDays -le $WarrantyMaxCacheAgeDays)
+            {
                 Write-CMTraceLog "[$SerialNumber] Using cached warranty data from $CachePath"
                 Write-CMTraceLog "[$SerialNumber] Skipping API call, using saved JSON."
                 $cached = Get-Content $CachePath -Raw | ConvertFrom-Json
@@ -1325,25 +1522,44 @@ function Get-Warranty {
                 $cached.WarrantyEndDate = [datetime]$cached.WarrantyEndDate
                 return $cached
             }
-            else {
+            else
+            {
                 Write-CMTraceLog "[$SerialNumber] Cache expired ($([math]::Round($fileAge.TotalDays,1)) days old). Refreshing..."
             }
         }
     }
-    catch {
+    catch
+    {
         Write-CMTraceLog "[$SerialNumber] Exception during cache read: $($_.Exception.Message)"
     }
     $normalizedMake = ($Manufacturer -replace '\s+', ' ').Trim().ToUpper()
     Write-CMTraceLog "Entering warranty switch block with: [$normalizedMake]"
     $WarrantyData = $null
-    switch -Regex ($normalizedMake) {
-        "^DELL" { $WarrantyData = Get-DellWarranty -SourceDevice $SerialNumber; break }
-        "^LENOVO|^IBM" { $WarrantyData = Get-LenovoWarranty -SourceDevice $SerialNumber; break }
-        "^INSYDE" { $WarrantyData = Get-GetacWarranty -SourceDevice $SerialNumber; break }
-        "^HP" { $WarrantyData = Get-HPWarranty -SourceDevice $SerialNumber; break }
-        default { Write-CMTraceLog "[$SerialNumber] Manufacturer '$Manufacturer' not supported for warranty lookup." }
+    switch -Regex ($normalizedMake)
+    {
+        "^DELL"
+        {
+            $WarrantyData = Get-DellWarranty -SourceDevice $SerialNumber; break
+        }
+        "^LENOVO|^IBM"
+        {
+            $WarrantyData = Get-LenovoWarranty -SourceDevice $SerialNumber; break
+        }
+        "^INSYDE"
+        {
+            $WarrantyData = Get-GetacWarranty -SourceDevice $SerialNumber; break
+        }
+        "^HP"
+        {
+            $WarrantyData = Get-HPWarranty -SourceDevice $SerialNumber; break
+        }
+        default
+        {
+            Write-CMTraceLog "[$SerialNumber] Manufacturer '$Manufacturer' not supported for warranty lookup."
+        }
     }
-    if ($WarrantyData) {
+    if ($WarrantyData)
+    {
         $WarrantyData | ConvertTo-Json -Depth 5 | Out-File -FilePath $CachePath -Encoding UTF8
         Write-CMTraceLog "[$SerialNumber] Warranty data cached at $CachePath"
         return $WarrantyData
@@ -1353,7 +1569,7 @@ function Get-Warranty {
 
 
 # Function to create the authorization signature
-Function New-Signature (
+function New-Signature (
     # Function to create the authorization signature
     <#
 .SYNOPSIS
@@ -1376,8 +1592,9 @@ Function New-Signature (
     The API resource path.
 .OUTPUTS
     String containing the authorization header value.
-#>    
-    $customerId, $sharedKey, $date, $contentLength, $method, $contentType, $resource) {
+#>
+    $customerId, $sharedKey, $date, $contentLength, $method, $contentType, $resource)
+{
     $xHeaders = "x-ms-date:" + $date
     $stringToHash = $method + "`n" + $contentLength + "`n" + $contentType + "`n" + $xHeaders + "`n" + $resource
 
@@ -1393,7 +1610,7 @@ Function New-Signature (
 }
 
 # Function to create and post the request
-Function Send-LogAnalyticsData(
+function Send-LogAnalyticsData(
     <#
     .SYNOPSIS
     Sends data to Azure Log Analytics.
@@ -1409,8 +1626,9 @@ Function Send-LogAnalyticsData(
     The custom log type name.
     .OUTPUTS
     String with the HTTP status code and payload size.
-    #>    
-    $customerId, $sharedKey, $body, $logType) {
+    #>
+    $customerId, $sharedKey, $body, $logType)
+{
     $method = "POST"
     $contentType = "application/json"
     $resource = "/api/logs"
@@ -1427,7 +1645,8 @@ Function Send-LogAnalyticsData(
     $uri = "https://" + $customerId + ".ods.opinsights.azure.com" + $resource + "?api-version=2016-04-01"
 
     #validate that payload data does not exceed limits
-    if ($body.Length -gt (31.9 * 1024 * 1024)) {
+    if ($body.Length -gt (31.9 * 1024 * 1024))
+    {
         throw("Upload payload is too big and exceed the 32Mb limit for a single upload. Please reduce the payload size. Current payload size is: " + ($body.Length / 1024 / 1024).ToString("#.#") + "Mb")
     }
 
@@ -1446,7 +1665,7 @@ Function Send-LogAnalyticsData(
 }
 
 # Function to create and post the request using DataCollectorAPI
-Function Send-DataCollectorAPI(
+function Send-DataCollectorAPI(
     <#
     .SYNOPSIS
     Sends data to Azure Log Analytics.
@@ -1462,8 +1681,9 @@ Function Send-DataCollectorAPI(
     The custom log type name.
     .OUTPUTS
     String with the HTTP status code and payload size.
-    #>    
-    $customerId, $sharedKey, $body, $logType) {
+    #>
+    $customerId, $sharedKey, $body, $logType)
+{
     $method = "POST"
     $contentType = "application/json"
     $resource = "/api/logs"
@@ -1480,7 +1700,8 @@ Function Send-DataCollectorAPI(
     $uri = "https://" + $customerId + ".ods.opinsights.azure.com" + $resource + "?api-version=2016-04-01"
 
     #validate that payload data does not exceed limits
-    if ($body.Length -gt (31.9 * 1024 * 1024)) {
+    if ($body.Length -gt (31.9 * 1024 * 1024))
+    {
         throw("Upload payload is too big and exceed the 32Mb limit for a single upload. Please reduce the payload size. Current payload size is: " + ($body.Length / 1024 / 1024).ToString("#.#") + "Mb")
     }
 
@@ -1498,7 +1719,7 @@ Function Send-DataCollectorAPI(
     return $statusmessage
 }
 # Function to create the bearer token
-Function New-BearerToken(
+function New-BearerToken(
     # Function to create the Bearer Token
     <#
 .SYNOPSIS
@@ -1513,8 +1734,9 @@ Function New-BearerToken(
     The secret created for the above client
 .OUTPUTS
     String containing the bearer token value.
-#>    
-    $tenantId, $clientId, $clientSecret){
+#>
+    $tenantId, $clientId, $clientSecret)
+{
     $scope = [System.Web.HttpUtility]::UrlEncode("https://monitor.azure.com//.default")
     $body = "client_id=$clientId&scope=$scope&client_secret=$clientSecret&grant_type=client_credentials"
     $headers = @{"Content-Type" = "application/x-www-form-urlencoded" }
@@ -1531,26 +1753,44 @@ Function New-BearerToken(
 # rejects the submission does it back off and cycle again, up to $SubmissionMaxRetries.
 # Returns the response on success, or $null after exhausting retries, so a failed stream
 # does not abort the run. $StartIndex spreads devices evenly across the pool.
-Function Invoke-LogSubmission([string[]]$Uris, $Body, [hashtable]$Headers = @{}, [int]$StartIndex = 0) {
+function Invoke-LogSubmission([string[]]$Uris, $Body, [hashtable]$Headers = @{}, [int]$StartIndex = 0)
+{
     $n = $Uris.Count
-    if ($n -lt 1) { return $null }
+    if ($n -lt 1)
+    {
+        return $null
+    }
     $lastCode = $null
     $lastMsg = ""
     $cycle = 0
     $wait = [Math]::Min($SubmissionInitialWaitSeconds, $SubmissionMaxWaitSeconds)
-    while ($true) {
-        for ($i = 0; $i -lt $n; $i++) {
+    while ($true)
+    {
+        for ($i = 0; $i -lt $n; $i++)
+        {
             $uri = $Uris[($StartIndex + $cycle + $i) % $n]
-            try {
+            try
+            {
                 return Invoke-WebRequest -Uri $uri -Method "POST" -Headers $Headers -Body $Body -ContentType "application/json" -UseBasicParsing
             }
-            catch {
+            catch
+            {
                 $lastCode = $null
-                if ($_.Exception.Response) { try { $lastCode = [int]$_.Exception.Response.StatusCode } catch {} }
+                if ($_.Exception.Response)
+                {
+                    try
+                    {
+                        $lastCode = [int]$_.Exception.Response.StatusCode
+                    }
+                    catch
+                    {
+                    }
+                }
                 $lastMsg = $_.Exception.Message
             }
         }
-        if ($cycle -ge $SubmissionMaxRetries) {
+        if ($cycle -ge $SubmissionMaxRetries)
+        {
             Write-CMTraceLog "Submission failed after $cycle backoff cycle(s) across $n target(s) (last status: $lastCode): $lastMsg" -ErrorMsg
             return $null
         }
@@ -1562,7 +1802,7 @@ Function Invoke-LogSubmission([string[]]$Uris, $Body, [hashtable]$Headers = @{},
 }
 
 # Function to create and post the request using LogIngestionAPI
-Function Send-LogIngestionAPI(
+function Send-LogIngestionAPI(
     <#
     .SYNOPSIS
     Sends data to Azure Log Analytics.
@@ -1578,13 +1818,15 @@ Function Send-LogIngestionAPI(
     The custom log type name.
     .OUTPUTS
     String with the HTTP status code and payload size.
-    #>    
-    $tenantId, $clientId, $clientSecret, $body, $dceURI, $dcrImmutableId, $logType) {
+    #>
+    $tenantId, $clientId, $clientSecret, $body, $dceURI, $dcrImmutableId, $logType)
+{
     $method = "POST"
     $contentType = "application/json"
 
     #validate that payload data does not exceed limits
-    if ($body.Length -gt (0.9 * 1024 * 1024)) {
+    if ($body.Length -gt (0.9 * 1024 * 1024))
+    {
         throw("Upload payload is too big and exceed the 1Mb limit for a single upload. Please reduce the payload size. Current payload size is: " + ($body.Length / 1024 / 1024).ToString("#.#") + "Mb")
     }
 
@@ -1595,21 +1837,27 @@ Function Send-LogIngestionAPI(
     # returned assertion for the inventory managed identity's token - no secret on the device.
     # Otherwise fall back to the classic client-secret token (New-BearerToken, unchanged). The DCR
     # upload below is identical either way.
-    if ($BrokerUrl -and $BrokerUrl -notmatch '^<Enter') {
+    if ($BrokerUrl -and $BrokerUrl -notmatch '^<Enter')
+    {
         $cert = Get-ChildItem Cert:\LocalMachine\My |
             Where-Object { $_.Issuer -match 'CN=MS-Organization-Access' } |
             Sort-Object NotAfter -Descending | Select-Object -First 1
-        if (-not $cert -or -not $cert.HasPrivateKey) {
+        if (-not $cert -or -not $cert.HasPrivateKey)
+        {
             throw "Broker mode: no usable Entra Join certificate found (issuer CN=MS-Organization-Access). Run as SYSTEM/elevated on an Entra-joined device."
         }
         $assertion = (Invoke-RestMethod -Method "Post" -Uri ($BrokerUrl.TrimEnd('/') + "/token") -Certificate $cert -TimeoutSec 30).client_assertion
-        if (-not $assertion) { throw "Broker did not return a client_assertion." }
+        if (-not $assertion)
+        {
+            throw "Broker did not return a client_assertion."
+        }
         $tokScope = [System.Web.HttpUtility]::UrlEncode("https://monitor.azure.com//.default")
-        $tokBody  = "client_id=$BrokerClientId&scope=$tokScope&client_assertion_type=urn:ietf:params:oauth:client-assertion-type:jwt-bearer&client_assertion=$assertion&grant_type=client_credentials"
-        $tokUri   = "https://login.microsoftonline.com/$tenantId/oauth2/v2.0/token"
+        $tokBody = "client_id=$BrokerClientId&scope=$tokScope&client_assertion_type=urn:ietf:params:oauth:client-assertion-type:jwt-bearer&client_assertion=$assertion&grant_type=client_credentials"
+        $tokUri = "https://login.microsoftonline.com/$tenantId/oauth2/v2.0/token"
         $bearerToken = (Invoke-RestMethod -Uri $tokUri -Method "Post" -Body $tokBody -Headers @{ "Content-Type" = "application/x-www-form-urlencoded" }).access_token
     }
-    else {
+    else
+    {
         $bearerToken = New-BearerToken -tenantId $tenantId -clientId $clientId -clientSecret $clientSecret
     }
 
@@ -1620,18 +1868,26 @@ Function Send-LogIngestionAPI(
     $headers = @{ "Authorization" = "Bearer $bearerToken" }
 
     $startIndex = 0
-    if ($ManagedDeviceID -and $uris.Count -gt 1) {
+    if ($ManagedDeviceID -and $uris.Count -gt 1)
+    {
         $sum = 0
-        foreach ($ch in $ManagedDeviceID.ToCharArray()) { $sum += [int][char]$ch }
+        foreach ($ch in $ManagedDeviceID.ToCharArray())
+        {
+            $sum += [int][char]$ch
+        }
         $startIndex = $sum % $uris.Count
     }
 
     $response = Invoke-LogSubmission -Uris $uris -Body $body -Headers $headers -StartIndex $startIndex
-    if ($null -eq $response) { return "DCR upload failed after retries : $payloadsize" }
+    if ($null -eq $response)
+    {
+        return "DCR upload failed after retries : $payloadsize"
+    }
     $statusmessage = "$($response.StatusCode) : $($payloadsize)"
     return $statusmessage
 }
-function Start-PowerShellSysNative {
+function Start-PowerShellSysNative
+{
     <#
 .SYNOPSIS
     Launches a 64-bit PowerShell process from a 32-bit process.
@@ -1664,7 +1920,8 @@ function Start-PowerShellSysNative {
 
     # Read standard error output to determine if the 64-bit script process somehow failed
     $ErrorOutput = $Process.StandardError.ReadToEnd()
-    if ($ErrorOutput) {
+    if ($ErrorOutput)
+    {
         Write-Error -Message $ErrorOutput
     }
 }#endfunction
@@ -1679,24 +1936,28 @@ Write-CMTraceLog "Log API Mode: $LogAPIMode"
 # Delete old logs
 # Delete old logs
 Write-CMTraceLog "Cleaning up old transciption log files..."
-try {
+try
+{
     $oldLogs = Get-ChildItem "C:\Windows\Logs" -Filter "Intune_Inventory_*.log" -ErrorAction SilentlyContinue | Where-Object { $_.FullName -ne $logPath }
     Write-CMTraceLog "Found $($oldLogs.Count) old transciption log file(s) to delete"
     $oldLogs | Remove-Item -Force -ErrorAction SilentlyContinue
     Write-CMTraceLog "Old transciption logs cleaned up successfully"
 }
-catch {
+catch
+{
     Write-CMTraceLog "Error cleaning up old transciption logs: $($_.Exception.Message)" -WarningMsg
 }
 
 Write-CMTraceLog "Cleaning up old script log files..."
-try {
+try
+{
     $oldLogs = Get-ChildItem "C:\Windows\Logs" -Filter "Enhanced_Intune_Inventory_*.log" -ErrorAction SilentlyContinue | Where-Object { $_.FullName -ne $CMLog }
     Write-CMTraceLog "Found $($oldLogs.Count) old script log file(s) to delete"
     $oldLogs | Remove-Item -Force -ErrorAction SilentlyContinue
     Write-CMTraceLog "Old script logs cleaned up successfully"
 }
-catch {
+catch
+{
     Write-CMTraceLog "Error cleaning up old script logs: $($_.Exception.Message)" -WarningMsg
 }
 
@@ -1706,47 +1967,57 @@ Write-CMTraceLog "Gathering common device information..."
 
 #Get Intune DeviceID and ManagedDeviceName
 Write-CMTraceLog "Retrieving Intune enrollment information..."
-try {
-    if (@(Get-ChildItem HKLM:SOFTWARE\Microsoft\Enrollments\ -Recurse -ErrorAction SilentlyContinue | Where-Object { $_.PSChildName -eq 'MS DM Server' })) {
+try
+{
+    if (@(Get-ChildItem HKLM:SOFTWARE\Microsoft\Enrollments\ -Recurse -ErrorAction SilentlyContinue | Where-Object { $_.PSChildName -eq 'MS DM Server' }))
+    {
         $MSDMServerInfo = Get-ChildItem HKLM:SOFTWARE\Microsoft\Enrollments\ -Recurse | Where-Object { $_.PSChildName -eq 'MS DM Server' }
         $ManagedDeviceInfo = Get-ItemProperty -LiteralPath "Registry::$($MSDMServerInfo)"
         Write-CMTraceLog "Intune enrollment registry keys found"
     }
-    else {
+    else
+    {
         Write-CMTraceLog "No Intune enrollment registry keys found" -WarningMsg
     }
 }
-catch {
+catch
+{
     Write-CMTraceLog "Error retrieving Intune enrollment information: $($_.Exception.Message)" -ErrorMsg
 }
 
 $ManagedDeviceName = $ManagedDeviceInfo.EntDeviceName
 $ManagedDeviceID = $ManagedDeviceInfo.EntDMID
 
-if (!($ManagedDeviceID)){
+if (!($ManagedDeviceID))
+{
     Write-CMTraceLog "Managed Device Name is Not Found!" -ErrorMsg
     Write-CMTraceLog "DEVICE APPEARS TO BE UNMANAGED!" -ErrorMsg
 }
-else {
+else
+{
     Write-CMTraceLog "Managed Device Name: $ManagedDeviceName"
 }
 
-if (!($ManagedDeviceID)){
+if (!($ManagedDeviceID))
+{
     Write-CMTraceLog "Managed Device ID is Not Found!" -ErrorMsg
     Write-CMTraceLog "DEVICE APPEARS TO BE UNMANAGED!" -ErrorMsg
 
 }
-else {
+else
+{
     Write-CMTraceLog "Managed Device ID: $ManagedDeviceID"
 }
 
 #Get Computer Info
 Write-CMTraceLog "Retrieving computer information (Get-ComputerInfo)..."
-try {
+try
+{
     $ComputerInfo = Get-ComputerInfo
     Write-CMTraceLog "Computer information retrieved successfully"
 }
-catch {
+catch
+{
     Write-CMTraceLog "Error retrieving computer information: $($_.Exception.Message)" -ErrorMsg
     throw
 }
@@ -1756,24 +2027,29 @@ $ComputerManufacturer = $ComputerInfo.CsManufacturer
 Write-CMTraceLog "Computer Name: $ComputerName"
 Write-CMTraceLog "Manufacturer: $ComputerManufacturer"
 
-if ($ComputerManufacturer.ToUpper() -eq "LENOVO" -or $ComputerManufacturer.ToUpper() -eq "IBM") {
+if ($ComputerManufacturer.ToUpper() -eq "LENOVO" -or $ComputerManufacturer.ToUpper() -eq "IBM")
+{
     Write-CMTraceLog "Lenovo/IBM detected, retrieving model from Win32_ComputerSystemProduct..."
-    try {
+    try
+    {
         $ComputerModel = (Get-CimInstance -ClassName Win32_ComputerSystemProduct -ErrorAction SilentlyContinue).Version
         Write-CMTraceLog "Model retrieved: $ComputerModel"
     }
-    catch {
+    catch
+    {
         Write-CMTraceLog "Error retrieving Lenovo model: $($_.Exception.Message)" -WarningMsg
         $ComputerModel = $ComputerInfo.CsModel
     }
 }
-else {
+else
+{
     $ComputerModel = $ComputerInfo.CsModel
     Write-CMTraceLog "Model: $ComputerModel"
 }
 
 #region DEVICEINVENTORY
-if ($CollectDeviceInventory) {
+if ($CollectDeviceInventory)
+{
     Write-CMTraceLog "========== Starting Device Inventory Collection =========="
     #Set Name of Log
     $DeviceLog = "PowerStacksDeviceInventory$(if($LogAPIMode -eq "LogIngestionAPI"){"_CL"})"
@@ -1781,22 +2057,26 @@ if ($CollectDeviceInventory) {
 
     # Get Computer Inventory Information
     Write-CMTraceLog "Gathering basic computer inventory information..."
-    try {
+    try
+    {
         $ComputerLastBootUpTime = $ComputerInfo.OsLastBootUpTime.ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ss.fffffffZ")
         $ComputerPhysicalMemory = $ComputerInfo.CsTotalPhysicalMemory
         Write-CMTraceLog "Last boot time: $ComputerLastBootUpTime, Physical memory: $ComputerPhysicalMemory bytes"
     }
-    catch {
+    catch
+    {
         Write-CMTraceLog "Error retrieving boot time or memory: $($_.Exception.Message)" -ErrorMsg
     }
 
     Write-CMTraceLog "Retrieving processor information..."
-    try {
+    try
+    {
         $ComputerNumberOfProcessors = (Get-CimInstance -ClassName Win32_ComputerSystem -ErrorAction SilentlyContinue).NumberOfProcessors
         $ComputerCPU = Get-CimInstance win32_processor -ErrorAction SilentlyContinue | Select-Object Manufacturer, Name, MaxClockSpeed, NumberOfCores, NumberOfLogicalProcessors
         Write-CMTraceLog "Number of processors: $ComputerNumberOfProcessors"
     }
-    catch {
+    catch
+    {
         Write-CMTraceLog "Error retrieving CPU information: $($_.Exception.Message)" -ErrorMsg
     }
     $ComputerProcessorManufacturer = $ComputerCPU.Manufacturer | Get-Unique
@@ -1806,52 +2086,64 @@ if ($CollectDeviceInventory) {
     $ComputerNumberOfLogicalProcessors = $ComputerCPU.NumberOfLogicalProcessors | Get-Unique
     Write-CMTraceLog "CPU: $ComputerProcessorManufacturer $ComputerProcessorName, Cores: $ComputerNumberOfCores, Logical: $ComputerNumberOfLogicalProcessors"
 
-    try {
+    try
+    {
         $ComputerOSInstallDate = $ComputerInfo.OsInstallDate.ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ss.fffffffZ")
         Write-CMTraceLog "OS Install Date: $ComputerOSInstallDate"
     }
-    catch {
+    catch
+    {
         Write-CMTraceLog "Error retrieving OS install date: $($_.Exception.Message)" -WarningMsg
     }
 
     Write-CMTraceLog "Retrieving battery information..."
-    try {
+    try
+    {
         $BatteryDesignedCapacity = (Get-WmiObject -Class "BatteryStaticData" -Namespace "ROOT\WMI" -ErrorAction SilentlyContinue).DesignedCapacity
         $BatteryFullChargedCapacity = (Get-WmiObject -Class "BatteryFullChargedCapacity" -Namespace "ROOT\WMI" -ErrorAction SilentlyContinue).FullChargedCapacity
-        if ($BatteryDesignedCapacity) {
+        if ($BatteryDesignedCapacity)
+        {
             Write-CMTraceLog "Battery found - Designed: $BatteryDesignedCapacity, Full Charged: $BatteryFullChargedCapacity"
         }
-        else {
+        else
+        {
             Write-CMTraceLog "No battery detected (desktop or battery not available)"
         }
     }
-    catch {
+    catch
+    {
         Write-CMTraceLog "Error retrieving battery information: $($_.Exception.Message)" -WarningMsg
     }
 
     #Grab Built-in Monitors PNPDeviceID
     Write-CMTraceLog "Processing monitor inventory (RemoveBuiltInMonitors: $RemoveBuiltInMonitors)..."
-    if ($RemoveBuiltInMonitors) {
-        try {
+    if ($RemoveBuiltInMonitors)
+    {
+        try
+        {
             $BuiltInMonitors = Get-CimInstance Win32_DesktopMonitor -ErrorAction SilentlyContinue | Select-Object PNPDeviceID
             Write-CMTraceLog "Retrieved $($BuiltInMonitors.Count) built-in monitor(s) to filter"
         }
-        catch {
+        catch
+        {
             Write-CMTraceLog "Error retrieving built-in monitors: $($_.Exception.Message)" -WarningMsg
             $BuiltInMonitors = $null
         }
     }
-    else {
+    else
+    {
         $BuiltInMonitors = $null
     }
 
     #Grabs the Monitor objects from WMI
     Write-CMTraceLog "Retrieving monitor information from WMI..."
-    try {
+    try
+    {
         $Monitors = Get-WmiObject -Namespace "root\WMI" -Class "WMIMonitorID" -ErrorAction SilentlyContinue
         Write-CMTraceLog "Retrieved $($Monitors.Count) monitor(s) from WMI"
     }
-    catch {
+    catch
+    {
         Write-CMTraceLog "Error retrieving monitors from WMI: $($_.Exception.Message)" -WarningMsg
         $Monitors = @()
     }
@@ -1862,9 +2154,11 @@ if ($CollectDeviceInventory) {
     #Takes each monitor object found and runs the following code:
     Write-CMTraceLog "Processing monitor details..."
     $monitorProcessedCount = 0
-    foreach ($Monitor in $Monitors) {
+    foreach ($Monitor in $Monitors)
+    {
 
-        if (-Not($Monitor.InstanceName.Substring(0, $Monitor.InstanceName.LastIndexOf('_')) -in $BuiltInMonitors.PNPDeviceID)) {
+        if (-not($Monitor.InstanceName.Substring(0, $Monitor.InstanceName.LastIndexOf('_')) -in $BuiltInMonitors.PNPDeviceID))
+        {
 
             # Initialize variables with null by default
             $MonitorModel = $null
@@ -1872,17 +2166,20 @@ if ($CollectDeviceInventory) {
             $MonitorManufacturer = $null
 
             # Safely decode UserFriendlyName
-            if ($Monitor.UserFriendlyName -ne $null) {
+            if ($Monitor.UserFriendlyName -ne $null)
+            {
                 $MonitorModel = ([System.Text.Encoding]::ASCII.GetString($Monitor.UserFriendlyName)).Replace("$([char]0x0000)", "")
             }
 
             # Safely decode SerialNumberID
-            if ($Monitor.SerialNumberID -ne $null) {
+            if ($Monitor.SerialNumberID -ne $null)
+            {
                 $MonitorSerialNumber = ([System.Text.Encoding]::ASCII.GetString($Monitor.SerialNumberID)).Replace("$([char]0x0000)", "")
             }
 
             # Safely decode ManufacturerName
-            if ($Monitor.ManufacturerName -ne $null) {
+            if ($Monitor.ManufacturerName -ne $null)
+            {
                 $MonitorManufacturer = ([System.Text.Encoding]::ASCII.GetString($Monitor.ManufacturerName)).Replace("$([char]0x0000)", "")
             }
 
@@ -1904,11 +2201,13 @@ if ($CollectDeviceInventory) {
 
     # Obtain physical disk details
     Write-CMTraceLog "Retrieving physical disk information..."
-    try {
+    try
+    {
         $Disks = Get-PhysicalDisk -ErrorAction Stop | Where-Object { $_.BusType -match "NVMe|SATA|SAS|ATAPI|RAID" } | Select-Object -Property DeviceId, BusType, FirmwareVersion, HealthStatus, Manufacturer, Model, FriendlyName, SerialNumber, Size, MediaType
         Write-CMTraceLog "Retrieved $($Disks.Count) physical disk(s)"
     }
-    catch {
+    catch
+    {
         Write-CMTraceLog "Error retrieving physical disks: $($_.Exception.Message)" -ErrorMsg
         $Disks = @()
     }
@@ -1918,31 +2217,36 @@ if ($CollectDeviceInventory) {
 
     Write-CMTraceLog "Processing disk health and SMART data for $($Disks.Count) disk(s)..."
     $diskProcessedCount = 0
-    foreach ($Disk in ($Disks | Sort-Object DeviceID)) {
+    foreach ($Disk in ($Disks | Sort-Object DeviceID))
+    {
         $diskProcessedCount++
         Write-CMTraceLog "Processing disk $diskProcessedCount/$($Disks.Count): $($Disk.FriendlyName) (ID: $($Disk.DeviceID))"
 
         # Obtain disk health information from current disk
-        try {
+        try
+        {
             $DiskHealth = Get-PhysicalDisk | Where-Object { $_.DeviceId -eq $Disk.DeviceID } | Get-StorageReliabilityCounter -ErrorAction Stop | Select-Object -Property Wear, ReadErrorsTotal, ReadErrorsUncorrected, WriteErrorsTotal, WriteErrorsUncorrected, Temperature, TemperatureMax
         }
-        catch {
+        catch
+        {
             Write-CMTraceLog "Warning: Could not retrieve health data for disk $($Disk.DeviceID): $($_.Exception.Message)" -WarningMsg
             $DiskHealth = $null
         }
 
         # Obtain SMART failure information
-        try {
+        try
+        {
             $DrivePNPDeviceID = (Get-WmiObject -Class Win32_DiskDrive -ErrorAction SilentlyContinue | Where-Object { $_.Index -eq $Disk.DeviceID }).PNPDeviceID
-            $DriveSMARTStatus = (Get-WmiObject -namespace root\wmi -class MSStorageDriver_FailurePredictStatus -ErrorAction SilentlyContinue | Select-Object PredictFailure, Reason) | Where-Object { $_.InstanceName -eq $DrivePNPDeviceID }
+            $DriveSMARTStatus = (Get-WmiObject -Namespace root\wmi -Class MSStorageDriver_FailurePredictStatus -ErrorAction SilentlyContinue | Select-Object PredictFailure, Reason) | Where-Object { $_.InstanceName -eq $DrivePNPDeviceID }
         }
-        catch {
+        catch
+        {
             Write-CMTraceLog "Warning: Could not retrieve SMART data for disk $($Disk.DeviceID): $($_.Exception.Message)" -WarningMsg
             $DriveSMARTStatus = $null
         }
 
         # Create custom PSObject
-        $tempdisk = new-object -TypeName PSObject
+        $tempdisk = New-Object -TypeName PSObject
 
         # Create disk health state entry
         $tempdisk | Add-Member -MemberType NoteProperty -Name "Number" -Value $Disk.DeviceID
@@ -1973,11 +2277,13 @@ if ($CollectDeviceInventory) {
 
     # Query Win32_SystemEnclosure
     Write-CMTraceLog "Retrieving system chassis information..."
-    try {
+    try
+    {
         $SystemEnclosures = Get-WmiObject -Class Win32_SystemEnclosure -ErrorAction Stop
         Write-CMTraceLog "Retrieved $($SystemEnclosures.Count) system enclosure(s)"
     }
-    catch {
+    catch
+    {
         Write-CMTraceLog "Error retrieving system enclosures: $($_.Exception.Message)" -ErrorMsg
         $SystemEnclosures = @()
     }
@@ -1987,12 +2293,14 @@ if ($CollectDeviceInventory) {
 
     # Process each enclosure instance
     Write-CMTraceLog "Processing chassis type information..."
-    foreach ($Enclosure in $SystemEnclosures) {
+    foreach ($Enclosure in $SystemEnclosures)
+    {
         $ChassisTypeCodes = $Enclosure.ChassisTypes | ForEach-Object { [int]$_ }
         $SMBIOSAssetTag = $Enclosure.SMBIOSAssetTag
 
         # Process each ChassisTypeCode for this enclosure
-        foreach ($ChassisTypeCode in $ChassisTypeCodes) {
+        foreach ($ChassisTypeCode in $ChassisTypeCodes)
+        {
             # Create custom PSObject
             $tempChassis = New-Object -TypeName PSObject
             $tempChassis | Add-Member -MemberType NoteProperty -Name "ChassisTypeCode" -Value $ChassisTypeCode
@@ -2007,22 +2315,26 @@ if ($CollectDeviceInventory) {
 
 
     # CollectMicrosoft365
-    if ($CollectMicrosoft365) {
+    if ($CollectMicrosoft365)
+    {
         Write-CMTraceLog "========== Collecting Microsoft 365 Information =========="
         # Get Microsoft 365
         Write-CMTraceLog 'Calling Get-Microsoft365 function...'
         $Microsoft365Data = Get-Microsoft365
-        if ($Microsoft365Data) {
+        if ($Microsoft365Data)
+        {
             Write-CMTraceLog "Microsoft 365 data retrieved successfully"
         }
-        else {
+        else
+        {
             Write-CMTraceLog "No Microsoft 365 data returned (may not be Click-to-Run Office)" -WarningMsg
         }
 
         #Creates an empty object to hold the data
         $Microsoft365 = New-Object -TypeName PSObject
 
-        if ($Microsoft365Data) {   
+        if ($Microsoft365Data)
+        {
             $Microsoft365 | Add-Member -MemberType NoteProperty -Name "InstalledVersion" -Value $Microsoft365Data.InstalledVersion
             $Microsoft365 | Add-Member -MemberType NoteProperty -Name "UpdateChannel" -Value $Microsoft365Data.UpdateChannel
             $Microsoft365 | Add-Member -MemberType NoteProperty -Name "LatestReleaseType" -Value $Microsoft365Data.LatestReleaseType
@@ -2034,48 +2346,58 @@ if ($CollectDeviceInventory) {
     }
 
     # CollectWarranty
-    if ($CollectWarranty) {
+    if ($CollectWarranty)
+    {
         Write-CMTraceLog "========== Collecting Warranty Information =========="
-        try {
+        try
+        {
             $WarrantyBios = Get-WmiObject Win32_Bios -ErrorAction Stop
             $WarrantyMake = $WarrantyBios.Manufacturer
             $WarrantySerialNumber = $WarrantyBios.SerialNumber
             Write-CMTraceLog "Warranty Make  : $WarrantyMake"
             Write-CMTraceLog "Warranty Serial: $WarrantySerialNumber"
         }
-        catch {
+        catch
+        {
             Write-CMTraceLog "Error retrieving BIOS information for warranty: $($_.Exception.Message)" -ErrorMsg
         }
 
         Write-CMTraceLog "Calling Get-Warranty function..."
         $WarrantyData = Get-Warranty -SerialNumber $WarrantySerialNumber -Manufacturer $WarrantyMake
-        if ($WarrantyData) {
+        if ($WarrantyData)
+        {
             Write-CMTraceLog "Warranty data retrieved successfully"
         }
-        else {
+        else
+        {
             Write-CMTraceLog "No warranty data returned" -WarningMsg
         }
-        if ($WarrantyData) {
+        if ($WarrantyData)
+        {
             $Warranty = [PSCustomObject]@{
                 'ServiceProvider'         = $WarrantyData.ServiceProvider
                 'ServiceModel'            = $WarrantyData.ServiceModel
                 'ServiceTag'              = $WarrantyData.ServiceTag
                 'ServiceLevelDescription' = $WarrantyData.ServiceLevelDescription
-                'WarrantyStartDate'       = if ($WarrantyData.WarrantyStartDate){
-                ([datetime]::Parse($WarrantyData.WarrantyStartDate)).ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ss.fffffffZ")
+                'WarrantyStartDate'       = if ($WarrantyData.WarrantyStartDate)
+                {
+                    ([datetime]::Parse($WarrantyData.WarrantyStartDate)).ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ss.fffffffZ")
                 }
-                else {
+                else
+                {
                     $null
                 }
-                'WarrantyEndDate'         = if ($WarrantyData.WarrantyEndDate){
-                ([datetime]::Parse($WarrantyData.WarrantyEndDate)).ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ss.fffffffZ")
+                'WarrantyEndDate'         = if ($WarrantyData.WarrantyEndDate)
+                {
+                    ([datetime]::Parse($WarrantyData.WarrantyEndDate)).ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ss.fffffffZ")
                 }
-                else {
+                else
+                {
                     $null
                 }
             }
 
-            $Warranty | Format-List         
+            $Warranty | Format-List
 
         }
     }
@@ -2099,10 +2421,12 @@ if ($CollectDeviceInventory) {
     $Inventory | Add-Member -MemberType NoteProperty -Name "DeviceModel" -Value "$ComputerModel" -Force
     $Inventory | Add-Member -MemberType NoteProperty -Name "Chassis" -Value $ChassisArrayList -Force
     $Inventory | Add-Member -MemberType NoteProperty -Name "OSInstallDate" -Value "$ComputerOSInstallDate" -Force
-    if ($CollectMicrosoft365) {
+    if ($CollectMicrosoft365)
+    {
         $Inventory | Add-Member -MemberType NoteProperty -Name "Microsoft365" -Value $Microsoft365 -Force
     }
-    if ($CollectWarranty) {
+    if ($CollectWarranty)
+    {
         $Inventory | Add-Member -MemberType NoteProperty -Name "Warranty" -Value $Warranty -Force
     }
 
@@ -2111,7 +2435,8 @@ if ($CollectDeviceInventory) {
     Write-CMTraceLog "Device inventory JSON size: $($DeviceDetailsJson.Length) characters"
 
     Write-CMTraceLog "Compressing device inventory JSON with GZip..."
-    try {
+    try
+    {
         $ms = New-Object System.IO.MemoryStream
         $cs = New-Object System.IO.Compression.GZipStream($ms, [System.IO.Compression.CompressionMode]::Compress)
         $sw = New-Object System.IO.StreamWriter($cs)
@@ -2120,7 +2445,8 @@ if ($CollectDeviceInventory) {
         $DeviceDetailsJson = [System.Convert]::ToBase64String($ms.ToArray())
         Write-CMTraceLog "Device inventory compressed successfully, Base64 size: $($DeviceDetailsJson.Length) characters"
     }
-    catch {
+    catch
+    {
         Write-CMTraceLog "Error compressing device inventory: $($_.Exception.Message)" -ErrorMsg
         throw
     }
@@ -2129,26 +2455,33 @@ if ($CollectDeviceInventory) {
     $MainDevice = New-Object -TypeName PSObject
     $MainDevice | Add-Member -MemberType NoteProperty -Name "ComputerName$(if($LogAPIMode -eq "LogIngestionAPI"){"_s"})" -Value "$ComputerName" -Force
     $MainDevice | Add-Member -MemberType NoteProperty -Name "ManagedDeviceID$(if($LogAPIMode -eq "LogIngestionAPI"){"_g"})" -Value "$ManagedDeviceID" -Force
-    if ($CollectMicrosoft365) {
+    if ($CollectMicrosoft365)
+    {
         $MainDevice | Add-Member -MemberType NoteProperty -Name "Microsoft365$(if($LogAPIMode -eq "LogIngestionAPI"){"_b"})" -Value $true -Force
     }
-    if ($CollectWarranty -and $Warranty -and $Warranty.PSObject.Properties.Count -gt 0) {
+    if ($CollectWarranty -and $Warranty -and $Warranty.PSObject.Properties.Count -gt 0)
+    {
         Write-CMTraceLog "Warranty property count: $($Warranty.PSObject.Properties.Count)"
         Write-CMTraceLog "Warranty data contents:`n$($WarrantyData | Out-String)"
         Write-CMTraceLog "Warranty contents:`n$($Warranty | Out-String)"
         $MainDevice | Add-Member -MemberType NoteProperty -Name "Warranty$(if($LogAPIMode -eq "LogIngestionAPI"){"_b"})" -Value $true -Force
     }
-    else {
-        if (-not $CollectWarranty) {
+    else
+    {
+        if (-not $CollectWarranty)
+        {
             Write-CMTraceLog "Warranty collection not enabled. Skipping warranty flag."
         }
-        elseif (-not $Warranty) {
+        elseif (-not $Warranty)
+        {
             Write-CMTraceLog "Warranty object is null."
         }
-        elseif ($Warranty.PSObject.Properties.Count -eq 0) {
+        elseif ($Warranty.PSObject.Properties.Count -eq 0)
+        {
             Write-CMTraceLog "Warranty object is present but has no properties."
         }
-        else {
+        else
+        {
             Write-CMTraceLog "Warranty check did not meet conditions. Unexpected state."
         }
         $MainDevice | Add-Member -MemberType NoteProperty -Name "Warranty$(if($LogAPIMode -eq "LogIngestionAPI"){"_b"})" -Value $false -Force
@@ -2157,87 +2490,117 @@ if ($CollectDeviceInventory) {
     Write-CMTraceLog "Splitting device details into chunks..."
     $DeviceDetailsJsonArr = $DeviceDetailsJson -split "(.{$(if($LogAPIMode -eq 'LogIngestionAPI'){64512}else{31744})})"
     $i = 0
-    foreach ($DeviceDetails in $DeviceDetailsJsonArr) {
-        if ($DeviceDetails.Length -gt 0 ) {
+    foreach ($DeviceDetails in $DeviceDetailsJsonArr)
+    {
+        if ($DeviceDetails.Length -gt 0 )
+        {
             $i++
-            $MainDevice | Add-Member -MemberType NoteProperty -Name ("DeviceDetails" + $i.ToString() +"$(if($LogAPIMode -eq "LogIngestionAPI"){"_s"})") -Value $DeviceDetails -Force
+            $MainDevice | Add-Member -MemberType NoteProperty -Name ("DeviceDetails" + $i.ToString() + "$(if($LogAPIMode -eq "LogIngestionAPI"){"_s"})") -Value $DeviceDetails -Force
         }
     }
     Write-CMTraceLog "Device details split into $i chunk(s)"
 
-    if ($DeviceDetailsJson.Length -gt $(if($LogAPIMode -eq "LogIngestionAPI"){10*63*1024}else{10*31*1024})) {
+    if ($DeviceDetailsJson.Length -gt $(if ($LogAPIMode -eq "LogIngestionAPI")
+            {
+                10 * 63 * 1024
+            }
+            else
+            {
+                10 * 31 * 1024
+            }))
+    {
         $errorMsg = "DeviceDetails is too big and exceeds the $(if($LogAPIMode -eq 'LogIngestionAPI'){64}else{32})Kb limit per column for a single upload. Please increase number of columns (#10). Current payload size is: $(($DeviceDetailsJson.Length/1024).ToString('#.#')) Kb"
         Write-CMTraceLog $errorMsg -ErrorMsg
         throw $errorMsg
     }
 
     Write-CMTraceLog "Converting main device object to JSON for upload..."
-    $DeviceJson = if($LogAPIMode -eq "LogIngestionAPI") { "[$($MainDevice | ConvertTo-Json -Compress)]" } else { $MainDevice | ConvertTo-Json }
+    $DeviceJson = if ($LogAPIMode -eq "LogIngestionAPI")
+    {
+        "[$($MainDevice | ConvertTo-Json -Compress)]"
+    }
+    else
+    {
+        $MainDevice | ConvertTo-Json
+    }
     Write-CMTraceLog "Final device JSON payload size: $($DeviceJson.Length) characters"
 
     # Submit the data to the API endpoint
     Write-CMTraceLog "Uploading device inventory to Log Analytics (Mode: $LogAPIMode)..."
     $ResponseDeviceInventory =
-        if($LogAPIMode -eq "LogIngestionAPI") {
-            Write-CMTraceLog "Calling Send-LogIngestionAPI for device inventory..."
-            Send-LogIngestionAPI -tenantId $TenantId -clientId $ClientId -clientSecret $ClientSecret -body ([System.Text.Encoding]::UTF8.GetBytes($DeviceJson)) -dceURI $DceURI -dcrImmutableId $DcrImmutableId -logType $DeviceLog
-        } else {
-            Write-CMTraceLog "Calling Send-DataCollectorAPI for device inventory..."
-            Send-DataCollectorAPI -customerId $customerId -sharedKey $sharedKey -body ([System.Text.Encoding]::UTF8.GetBytes($DeviceJson)) -logType $DeviceLog
-        }
+    if ($LogAPIMode -eq "LogIngestionAPI")
+    {
+        Write-CMTraceLog "Calling Send-LogIngestionAPI for device inventory..."
+        Send-LogIngestionAPI -tenantId $TenantId -clientId $ClientId -clientSecret $ClientSecret -body ([System.Text.Encoding]::UTF8.GetBytes($DeviceJson)) -dceURI $DceURI -dcrImmutableId $DcrImmutableId -logType $DeviceLog
+    }
+    else
+    {
+        Write-CMTraceLog "Calling Send-DataCollectorAPI for device inventory..."
+        Send-DataCollectorAPI -customerId $customerId -sharedKey $sharedKey -body ([System.Text.Encoding]::UTF8.GetBytes($DeviceJson)) -logType $DeviceLog
+    }
     Write-CMTraceLog "Device inventory upload response: $ResponseDeviceInventory"
 }
 # end region DEVICEINVENTORY
 
 # region APPINVENTORY
-if ($CollectAppInventory) {
+if ($CollectAppInventory)
+{
     Write-CMTraceLog "========== Starting App Inventory Collection =========="
     #Set Name of Log
     $AppLog = "PowerStacksAppInventory$(if($LogAPIMode -eq "LogIngestionAPI"){"_CL"})"
     Write-CMTraceLog "App inventory log name: $AppLog"
 
     Write-CMTraceLog "Determining currently logged on user..."
-    try {
+    try
+    {
         $CurrentLoggedOnUser = (Get-WmiObject -Class win32_computersystem -ErrorAction SilentlyContinue).UserName
-        if ($null -eq $CurrentLoggedOnUser) {
+        if ($null -eq $CurrentLoggedOnUser)
+        {
             Write-CMTraceLog "No user from win32_computersystem, attempting to get from explorer.exe process..."
             $CurrentOwner = Get-CimInstance Win32_Process -Filter 'name = "explorer.exe"' -ErrorAction SilentlyContinue | Invoke-CimMethod -MethodName getowner
             $CurrentLoggedOnUser = "$($CurrentOwner.Domain)\$($CurrentOwner.User)"
         }
         Write-CMTraceLog "Current logged on user: $CurrentLoggedOnUser"
     }
-    catch {
+    catch
+    {
         Write-CMTraceLog "Error determining logged on user: $($_.Exception.Message)" -ErrorMsg
     }
 
     Write-CMTraceLog "Translating user account to SID..."
     $UserSid = $null
-    try {
-        $AdObj  = New-Object System.Security.Principal.NTAccount($CurrentLoggedOnUser)
+    try
+    {
+        $AdObj = New-Object System.Security.Principal.NTAccount($CurrentLoggedOnUser)
         $strSID = $AdObj.Translate([System.Security.Principal.SecurityIdentifier])
         $UserSid = $strSID.Value
         Write-CMTraceLog "User SID: $UserSid"
     }
-    catch {
+    catch
+    {
         # IdentityNotMappedException: the account can't be resolved to a SID (orphaned/renamed/deleted
         # account, a stale explorer.exe owner, or a name the local resolver doesn't know). This is not
         # fatal - fall back to matching the user's profile folder in the registry, and if that also
         # fails, continue with no user SID (Get-InstalledApplications then returns machine-scope apps
         # only, since it always scans the HKLM uninstall keys).
         Write-CMTraceLog "Could not translate '$CurrentLoggedOnUser' to a SID ($($_.Exception.Message)). Trying profile-list fallback..." -WarningMsg
-        try {
+        try
+        {
             $userLeaf = ($CurrentLoggedOnUser -split '\\')[-1]
             $UserSid = Get-CimInstance Win32_UserProfile -ErrorAction Stop |
                 Where-Object { -not $_.Special -and $_.LocalPath -and (Split-Path $_.LocalPath -Leaf) -ieq $userLeaf } |
                 Select-Object -First 1 -ExpandProperty SID
-            if ($UserSid) {
+            if ($UserSid)
+            {
                 Write-CMTraceLog "Resolved user SID from profile list: $UserSid"
             }
-            else {
+            else
+            {
                 Write-CMTraceLog "No matching user profile found; continuing without a user SID (machine-scope app inventory only)." -WarningMsg
             }
         }
-        catch {
+        catch
+        {
             Write-CMTraceLog "Profile-list SID fallback failed ($($_.Exception.Message)); continuing without a user SID." -WarningMsg
         }
     }
@@ -2247,14 +2610,16 @@ if ($CollectAppInventory) {
     Write-CMTraceLog "Retrieved $($MyApps.Count) Win32 applications"
     $MyApps | ForEach-Object { $_ | Add-Member -NotePropertyName AppType -NotePropertyValue 'Win32' -Force }
 
-    if ($CollectUWPInventory) {
+    if ($CollectUWPInventory)
+    {
         Write-CMTraceLog "UWP inventory enabled, calling Get-AppxInstalledApplications..."
         $MyAppsAppx = Get-AppxInstalledApplications # Due to limitations of Get-AppxPackage on AADJ devices we don't use the SID
         Write-CMTraceLog "Retrieved $($MyAppsAppx.Count) UWP applications"
         $MyApps += $MyAppsAppx
         Write-CMTraceLog "Combined total: $($MyApps.Count) applications (Win32 + UWP)"
     }
-    else {
+    else
+    {
         Write-CMTraceLog "UWP inventory disabled, skipping"
     }
 
@@ -2271,56 +2636,71 @@ if ($CollectAppInventory) {
     Write-CMTraceLog "Building app array for upload..."
     $AppArray = @()
     $appArrayCount = 0
-    foreach ($App in $CleanAppList) {
+    foreach ($App in $CleanAppList)
+    {
         $tempapp = New-Object -TypeName PSObject
 
-        if ($null -ne $App.DisplayName) {
+        if ($null -ne $App.DisplayName)
+        {
             $tempapp | Add-Member -MemberType NoteProperty -Name "AppName" -Value $App.DisplayName -Force
             $appArrayCount++
         }
-        else {
+        else
+        {
             $tempapp | Add-Member -MemberType NoteProperty -Name "AppName" -Value "" -Force
         }
 
-        if ($null -ne $App.DisplayVersion) {
+        if ($null -ne $App.DisplayVersion)
+        {
             $tempapp | Add-Member -MemberType NoteProperty -Name "AppVersion" -Value $App.DisplayVersion -Force
         }
-        else {
+        else
+        {
             $tempapp | Add-Member -MemberType NoteProperty -Name "AppVersion" -Value "" -Force
         }
 
-        if ($null -ne $App.Publisher) {
+        if ($null -ne $App.Publisher)
+        {
             $tempapp | Add-Member -MemberType NoteProperty -Name "AppPublisher" -Value $App.Publisher -Force
         }
-        else {
+        else
+        {
             $tempapp | Add-Member -MemberType NoteProperty -Name "AppPublisher" -Value "" -Force
         }
 
-        if ($null -ne $App.AppType) {
+        if ($null -ne $App.AppType)
+        {
             $tempapp | Add-Member -MemberType NoteProperty -Name "AppType" -Value $App.AppType -Force
         }
-        else {
+        else
+        {
             $tempapp | Add-Member -MemberType NoteProperty -Name "AppType" -Value "Unknown" -Force
         }
 
-        if ($App.PSObject.Properties.Name -contains "InstallDate" -and $App.InstallDate) {
+        if ($App.PSObject.Properties.Name -contains "InstallDate" -and $App.InstallDate)
+        {
             $tempapp | Add-Member -MemberType NoteProperty -Name "AppInstallDate" -Value $App.InstallDate -Force
         }
-        else {
+        else
+        {
             $tempapp | Add-Member -MemberType NoteProperty -Name "AppInstallDate" -Value $null -Force
         }
 
-        if ($App.PSObject.Properties.Name -contains "UninstallString" -and $App.UninstallString) {
+        if ($App.PSObject.Properties.Name -contains "UninstallString" -and $App.UninstallString)
+        {
             $tempapp | Add-Member -MemberType NoteProperty -Name "AppUninstallString" -Value $App.UninstallString -Force
         }
-        else {
+        else
+        {
             $tempapp | Add-Member -MemberType NoteProperty -Name "AppUninstallString" -Value $null -Force
         }
 
-        if ($App.PSObject.Properties.Name -contains "PSPath" -and $App.PSPath) {
+        if ($App.PSObject.Properties.Name -contains "PSPath" -and $App.PSPath)
+        {
             $tempapp | Add-Member -MemberType NoteProperty -Name "AppUninstallRegPath" -Value $App.PSPath.Split("::")[-1] -Force
         }
-        else {
+        else
+        {
             $tempapp | Add-Member -MemberType NoteProperty -Name "AppUninstallRegPath" -Value $null -Force
         }
 
@@ -2333,7 +2713,8 @@ if ($CollectAppInventory) {
     Write-CMTraceLog "App inventory JSON size: $($InstalledAppJson.Length) characters"
 
     Write-CMTraceLog "Compressing app inventory JSON with GZip..."
-    try {
+    try
+    {
         $ms = New-Object System.IO.MemoryStream
         $cs = New-Object System.IO.Compression.GZipStream($ms, [System.IO.Compression.CompressionMode]::Compress)
         $sw = New-Object System.IO.StreamWriter($cs)
@@ -2342,7 +2723,8 @@ if ($CollectAppInventory) {
         $InstalledAppJson = [System.Convert]::ToBase64String($ms.ToArray())
         Write-CMTraceLog "App inventory compressed successfully, Base64 size: $($InstalledAppJson.Length) characters"
     }
-    catch {
+    catch
+    {
         Write-CMTraceLog "Error compressing app inventory: $($_.Exception.Message)" -ErrorMsg
         throw
     }
@@ -2355,42 +2737,63 @@ if ($CollectAppInventory) {
     Write-CMTraceLog "Splitting app inventory into chunks..."
     $InstalledAppJsonArr = $InstalledAppJson -split "(.{$(if($LogAPIMode -eq 'LogIngestionAPI'){64512}else{31744})})"
     $i = 0
-    foreach ($InstalledApp in $InstalledAppJsonArr) {
-            if ($InstalledApp.Length -gt 0 ) {
-                $i++
-                $MainApp | Add-Member -MemberType NoteProperty -Name ("InstalledApps" + $i.ToString() + "$(if($LogAPIMode -eq "LogIngestionAPI"){"_s"})") -Value $InstalledApp -Force
-            }
+    foreach ($InstalledApp in $InstalledAppJsonArr)
+    {
+        if ($InstalledApp.Length -gt 0 )
+        {
+            $i++
+            $MainApp | Add-Member -MemberType NoteProperty -Name ("InstalledApps" + $i.ToString() + "$(if($LogAPIMode -eq "LogIngestionAPI"){"_s"})") -Value $InstalledApp -Force
         }
-        Write-CMTraceLog "App inventory split into $i chunk(s)"
-
-        if ($InstalledAppJson.Length -gt $(if($LogAPIMode -eq "LogIngestionAPI"){10*63*1024}else{10*31*1024})) {
-            $errorMsg = "InstallApp is too big and exceed the $(if($LogAPIMode -eq 'LogIngestionAPI'){64}else{32})Kb limit per column for a single upload. Please increase number of columns (#10). Current payload size is: " + ($InstalledAppJson.Length / 1024).ToString("#.#") + "Kb"
-            Write-CMTraceLog $errorMsg -ErrorMsg
-            throw($errorMsg)
-        }
-
-        Write-CMTraceLog "Converting main app object to JSON for upload..."
-        $AppJson = if($LogAPIMode -eq "LogIngestionAPI") { "[$($MainApp | ConvertTo-Json -Compress)]" } else { $MainApp | ConvertTo-Json }
-        Write-CMTraceLog "Final app JSON payload size: $($AppJson.Length) characters"
-
-        # Submit the data to the API endpoint
-        Write-CMTraceLog "Uploading app inventory to Log Analytics (Mode: $LogAPIMode)..."
-        $ResponseAppInventory =
-            if($LogAPIMode -eq "LogIngestionAPI") {
-                Write-CMTraceLog "Calling Send-LogIngestionAPI for app inventory..."
-                Send-LogIngestionAPI -tenantId $TenantId -clientId $ClientId -clientSecret $ClientSecret -body ([System.Text.Encoding]::UTF8.GetBytes($AppJson)) -dceURI $DceURI -dcrImmutableId $DcrImmutableId -logType $AppLog
-            } else {
-                Write-CMTraceLog "Calling Send-DataCollectorAPI for app inventory..."
-                Send-DataCollectorAPI -customerId $customerId -sharedKey $sharedKey -body ([System.Text.Encoding]::UTF8.GetBytes($AppJson)) -logType $AppLog
-            }
-        Write-CMTraceLog "App inventory upload response: $ResponseAppInventory"
     }
+    Write-CMTraceLog "App inventory split into $i chunk(s)"
+
+    if ($InstalledAppJson.Length -gt $(if ($LogAPIMode -eq "LogIngestionAPI")
+            {
+                10 * 63 * 1024
+            }
+            else
+            {
+                10 * 31 * 1024
+            }))
+    {
+        $errorMsg = "InstallApp is too big and exceed the $(if($LogAPIMode -eq 'LogIngestionAPI'){64}else{32})Kb limit per column for a single upload. Please increase number of columns (#10). Current payload size is: " + ($InstalledAppJson.Length / 1024).ToString("#.#") + "Kb"
+        Write-CMTraceLog $errorMsg -ErrorMsg
+        throw($errorMsg)
+    }
+
+    Write-CMTraceLog "Converting main app object to JSON for upload..."
+    $AppJson = if ($LogAPIMode -eq "LogIngestionAPI")
+    {
+        "[$($MainApp | ConvertTo-Json -Compress)]"
+    }
+    else
+    {
+        $MainApp | ConvertTo-Json
+    }
+    Write-CMTraceLog "Final app JSON payload size: $($AppJson.Length) characters"
+
+    # Submit the data to the API endpoint
+    Write-CMTraceLog "Uploading app inventory to Log Analytics (Mode: $LogAPIMode)..."
+    $ResponseAppInventory =
+    if ($LogAPIMode -eq "LogIngestionAPI")
+    {
+        Write-CMTraceLog "Calling Send-LogIngestionAPI for app inventory..."
+        Send-LogIngestionAPI -tenantId $TenantId -clientId $ClientId -clientSecret $ClientSecret -body ([System.Text.Encoding]::UTF8.GetBytes($AppJson)) -dceURI $DceURI -dcrImmutableId $DcrImmutableId -logType $AppLog
+    }
+    else
+    {
+        Write-CMTraceLog "Calling Send-DataCollectorAPI for app inventory..."
+        Send-DataCollectorAPI -customerId $customerId -sharedKey $sharedKey -body ([System.Text.Encoding]::UTF8.GetBytes($AppJson)) -logType $AppLog
+    }
+    Write-CMTraceLog "App inventory upload response: $ResponseAppInventory"
+}
 # end region APPINVENTORY
 
 
 
 #region DRIVERINVENTORY
-if ($CollectDriverInventory) {
+if ($CollectDriverInventory)
+{
     Write-CMTraceLog "========== Starting Driver Inventory Collection =========="
     #Set Name of Log
     $DriverLog = "PowerStacksDriverInventory$(if($LogAPIMode -eq "LogIngestionAPI"){"_CL"})"
@@ -2403,7 +2806,8 @@ if ($CollectDriverInventory) {
 
     Write-CMTraceLog "Building driver array for upload..."
     $DriverArray = @()
-    foreach ($Driver in $Drivers) {
+    foreach ($Driver in $Drivers)
+    {
         $tempdriver = New-Object -TypeName PSObject
         $tempdriver | Add-Member -MemberType NoteProperty -Name "WUName" -Value $Driver.WUName -Force
         $tempdriver | Add-Member -MemberType NoteProperty -Name "DriverName" -Value $Driver.DriverName -Force
@@ -2428,7 +2832,8 @@ if ($CollectDriverInventory) {
     Write-CMTraceLog "Driver inventory JSON size: $($ListedDriverJson.Length) characters"
 
     Write-CMTraceLog "Compressing driver inventory JSON with GZip..."
-    try {
+    try
+    {
         $ms = New-Object System.IO.MemoryStream
         $cs = New-Object System.IO.Compression.GZipStream($ms, [System.IO.Compression.CompressionMode]::Compress)
         $sw = New-Object System.IO.StreamWriter($cs)
@@ -2437,7 +2842,8 @@ if ($CollectDriverInventory) {
         $ListedDriverJson = [System.Convert]::ToBase64String($ms.ToArray())
         Write-CMTraceLog "Driver inventory compressed successfully, Base64 size: $($ListedDriverJson.Length) characters"
     }
-    catch {
+    catch
+    {
         Write-CMTraceLog "Error compressing driver inventory: $($_.Exception.Message)" -ErrorMsg
         throw
     }
@@ -2450,34 +2856,54 @@ if ($CollectDriverInventory) {
     Write-CMTraceLog "Splitting driver inventory into chunks..."
     $ListedDriverJsonArr = $ListedDriverJson -split "(.{$(if($LogAPIMode -eq 'LogIngestionAPI'){64512}else{31744})})"
     $i = 0
-    foreach ($ListedDriver in $ListedDriverJsonArr) {
-        if ($ListedDriver.Length -gt 0 ) {
+    foreach ($ListedDriver in $ListedDriverJsonArr)
+    {
+        if ($ListedDriver.Length -gt 0 )
+        {
             $i++
             $MainDriver | Add-Member -MemberType NoteProperty -Name ("ListedDrivers" + $i.ToString() + "$(if($LogAPIMode -eq "LogIngestionAPI"){"_s"})") -Value $ListedDriver -Force
         }
     }
     Write-CMTraceLog "Driver inventory split into $i chunk(s)"
 
-    if ($ListedDriverJson.Length -gt $(if($LogAPIMode -eq "LogIngestionAPI"){10*63*1024}else{10*31*1024})) {
+    if ($ListedDriverJson.Length -gt $(if ($LogAPIMode -eq "LogIngestionAPI")
+            {
+                10 * 63 * 1024
+            }
+            else
+            {
+                10 * 31 * 1024
+            }))
+    {
         $errorMsg = "Driver is too big and exceed the $(if($LogAPIMode -eq 'LogIngestionAPI'){64}else{32})Kb limit per column for a single upload. Please increase number of columns (#10). Current payload size is: " + ($ListedDriverJson.Length / 1024).ToString("#.#") + "Kb"
         Write-CMTraceLog $errorMsg -ErrorMsg
         throw($errorMsg)
     }
 
     Write-CMTraceLog "Converting main driver object to JSON for upload..."
-    $DriverJson = if($LogAPIMode -eq "LogIngestionAPI") { "[$($MainDriver | ConvertTo-Json -Compress)]" } else { $MainDriver | ConvertTo-Json }
+    $DriverJson = if ($LogAPIMode -eq "LogIngestionAPI")
+    {
+        "[$($MainDriver | ConvertTo-Json -Compress)]"
+    }
+    else
+    {
+        $MainDriver | ConvertTo-Json
+    }
     Write-CMTraceLog "Final driver JSON payload size: $($DriverJson.Length) characters"
 
     # Submit the data to the API endpoint
     Write-CMTraceLog "Uploading driver inventory to Log Analytics (Mode: $LogAPIMode)..."
     $ResponseDriverInventory =
-        if($LogAPIMode -eq "LogIngestionAPI") {
-            Write-CMTraceLog "Calling Send-LogIngestionAPI for driver inventory..."
-            Send-LogIngestionAPI -tenantId $TenantId -clientId $ClientId -clientSecret $ClientSecret -body ([System.Text.Encoding]::UTF8.GetBytes($DriverJson)) -dceURI $DceURI -dcrImmutableId $DcrImmutableId -logType $DriverLog
-        } else {
-            Write-CMTraceLog "Calling Send-DataCollectorAPI for driver inventory..."
-            Send-DataCollectorAPI -customerId $customerId -sharedKey $sharedKey -body ([System.Text.Encoding]::UTF8.GetBytes($DriverJson)) -logType $DriverLog
-        }
+    if ($LogAPIMode -eq "LogIngestionAPI")
+    {
+        Write-CMTraceLog "Calling Send-LogIngestionAPI for driver inventory..."
+        Send-LogIngestionAPI -tenantId $TenantId -clientId $ClientId -clientSecret $ClientSecret -body ([System.Text.Encoding]::UTF8.GetBytes($DriverJson)) -dceURI $DceURI -dcrImmutableId $DcrImmutableId -logType $DriverLog
+    }
+    else
+    {
+        Write-CMTraceLog "Calling Send-DataCollectorAPI for driver inventory..."
+        Send-DataCollectorAPI -customerId $customerId -sharedKey $sharedKey -body ([System.Text.Encoding]::UTF8.GetBytes($DriverJson)) -logType $DriverLog
+    }
     Write-CMTraceLog "Driver inventory upload response: $ResponseDriverInventory"
 }
 #endregion DRIVERINVENTORY
@@ -2487,35 +2913,44 @@ Write-CMTraceLog "========== Generating Final Status Report =========="
 $date = (Get-Date).ToUniversalTime().ToString($InventoryDateFormat)
 $OutputMessage = "InventoryDate: $date "
 
-if ($CollectDeviceInventory) {
+if ($CollectDeviceInventory)
+{
     Write-CMTraceLog "Checking device inventory upload status..."
-    if ($ResponseDeviceInventory -match "$(if($LogAPIMode -eq 'LogIngestionAPI'){204}else{200}) :") {
+    if ($ResponseDeviceInventory -match "$(if($LogAPIMode -eq 'LogIngestionAPI'){204}else{200}) :")
+    {
         $OutputMessage = $OutPutMessage + "DeviceInventory: OK " + $ResponseDeviceInventory
         Write-CMTraceLog "Device inventory upload: SUCCESS"
     }
-    else {
+    else
+    {
         $OutputMessage = $OutPutMessage + "DeviceInventory: Fail "
         Write-CMTraceLog "Device inventory upload: FAILED" -ErrorMsg
     }
 }
-if ($CollectAppInventory) {
+if ($CollectAppInventory)
+{
     Write-CMTraceLog "Checking app inventory upload status..."
-    if ($ResponseAppInventory -match "$(if($LogAPIMode -eq 'LogIngestionAPI'){204}else{200}) :") {
+    if ($ResponseAppInventory -match "$(if($LogAPIMode -eq 'LogIngestionAPI'){204}else{200}) :")
+    {
         $OutputMessage = $OutPutMessage + " AppInventory: OK " + $ResponseAppInventory
         Write-CMTraceLog "App inventory upload: SUCCESS"
     }
-    else {
+    else
+    {
         $OutputMessage = $OutPutMessage + " AppInventory: Fail "
         Write-CMTraceLog "App inventory upload: FAILED" -ErrorMsg
     }
 }
-if ($CollectDriverInventory) {
+if ($CollectDriverInventory)
+{
     Write-CMTraceLog "Checking driver inventory upload status..."
-    if ($ResponseDriverInventory -match "$(if($LogAPIMode -eq 'LogIngestionAPI'){204}else{200}) :") {
+    if ($ResponseDriverInventory -match "$(if($LogAPIMode -eq 'LogIngestionAPI'){204}else{200}) :")
+    {
         $OutputMessage = $OutPutMessage + " DriverInventory: OK " + $ResponseDriverInventory
         Write-CMTraceLog "Driver inventory upload: SUCCESS"
     }
-    else {
+    else
+    {
         $OutputMessage = $OutPutMessage + " DriverInventory: Fail "
         Write-CMTraceLog "Driver inventory upload: FAILED" -ErrorMsg
     }
@@ -2524,8 +2959,9 @@ if ($CollectDriverInventory) {
 Write-CMTraceLog "========== Script Execution Completed =========="
 Write-CMTraceLog $OutputMessage
 
-if ($Transcribe){
-Stop-Transcript | Out-Null
+if ($Transcribe)
+{
+    Stop-Transcript | Out-Null
 }
 #endregion script
 
