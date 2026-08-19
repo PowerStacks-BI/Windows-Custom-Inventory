@@ -714,7 +714,15 @@ function Get-Microsoft365
     }
     else
     {
-        $CDNChannel = $ChannelPathMap[$OfficeChannel.Name]
+        if ($OfficeChannel -and $OfficeChannel.Name)
+        {
+            $CDNChannel = $ChannelPathMap[$OfficeChannel.Name]
+        }
+        else
+        {
+            $CDNChannel = $null
+            Write-CMTraceLog "Could not determine the Office update channel (no matching GPO/CDN channel); leaving it blank." -WarningMsg
+        }
     }
 
     Write-CMTraceLog "CDN channel path: $CDNChannel"
