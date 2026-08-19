@@ -41,10 +41,12 @@
 .NOTES
     Author: John Marcum (PowerStacks)
     Compatible with Windows PowerShell 5.1 (the Intune script host). No modules required.
-    This script is read-only on the network path: it never uploads inventory. With
-    valid $ClientId/$ClientSecret it will optionally request (but not use) an access
-    token to prove the sign-in path end to end; set $TestTokenAcquisition = $false to
-    skip that and stay purely connectivity-only.
+    This script does not upload inventory data. With valid $ClientId/$ClientSecret it
+    also requests an access token and, when $DcrImmutableId is set, sends one empty
+    probe to the real DCR stream to prove the ingestion path end to end (the empty body
+    writes nothing). That is the only check that reproduces the collector's upload and
+    catches a 404. Set $TestTokenAcquisition = $false or $TestIngestion = $false to stay
+    purely connectivity-only.
 #>
 
 #region settings ---------------------------------------------------------------
@@ -58,6 +60,10 @@ $TenantId        = "<Enter Your Tenant ID>"
 $ClientId        = "<Enter Your Client ID>"
 $ClientSecret    = "<Enter Your Client Secret>"
 $DceURI          = "<Enter Your DCE Log Ingestion URL>"          # https://xxxx.region.ingest.monitor.azure.com
+# DCR Immutable ID and stream, copied from the collector. Required for the end-to-end ingestion
+# dry-run that reproduces the collector's real upload - the ONLY check that catches an upload 404.
+$DcrImmutableId  = "<Enter Your DCR Immutable ID>"               # the DCR's IMMUTABLE ID (dcr-xxxxxxxx...), not its name or resource id
+$StreamName      = "Custom-PowerStacksDeviceInventory_CL"        # the device stream the collector posts to first
 # Optional Entra Token Broker (secretless) upload path. Leave the placeholder if unused.
 $BrokerUrl       = "<Enter Your Broker URL>"
 
@@ -72,6 +78,7 @@ $TestAllWarrantyVendors   = $false   # $true to test Dell, HP, Lenovo and Getac 
 # ----- Behavior -----
 $TimeoutSeconds           = 15       # per-request timeout
 $TestTokenAcquisition     = $true    # with a real ClientId/Secret, prove the sign-in path too
+$TestIngestion            = $true    # POST an empty probe to the real DCR stream (reproduces the collector's upload; catches a 404)
 #endregion settings ------------------------------------------------------------
 
 
@@ -81,6 +88,8 @@ $TestTokenAcquisition     = $true    # with a real ClientId/Secret, prove the si
 $Now    = Get-Date -Format "yyyy-MM-dd_HHmm"
 $CMLog  = "C:\Windows\Logs\PowerStacks_Inventory_Connectivity_$Now.log"
 $script:CMLog = $CMLog
+$script:AccessToken = $null
+$script:PreflightFailures = New-Object System.Collections.Generic.List[string]
 
 function Write-CMTraceLog {
     param(
@@ -327,14 +336,60 @@ if ($TestTokenAcquisition -and $LogAPIMode -eq "LogIngestionAPI" -and
         $tok = Invoke-RestMethod -Method Post -Uri "https://login.microsoftonline.com/$TenantId/oauth2/v2.0/token" `
             -Body $body -ContentType "application/x-www-form-urlencoded" -TimeoutSec $TimeoutSeconds -ErrorAction Stop
         if ($tok.access_token) {
+            $script:AccessToken = $tok.access_token
             Write-CMTraceLog "  [PASS] Acquired an access token. Sign-in and app credentials are good." -Type 1
         } else {
             Write-CMTraceLog "  [FAIL] Token endpoint responded but returned no access_token." -Type 3
+            $script:PreflightFailures.Add("Sign-in: token endpoint returned no access_token.")
         }
     } catch {
         Write-CMTraceLog "  [FAIL] Token request failed: $($_.Exception.Message)" -Type 3
         Write-CMTraceLog "         (A network failure here points at the proxy/firewall; an AADSTS error points at the app registration or secret.)" -Type 2
+        $script:PreflightFailures.Add("Sign-in: token request failed ($($_.Exception.Message)).")
     }
+}
+
+# --- Ingestion dry-run: reproduce the collector's actual upload (the only check that catches a 404) ---
+if ($TestIngestion -and $LogAPIMode -eq "LogIngestionAPI" -and $script:AccessToken -and
+    (Test-Configured $DceURI) -and (Test-Configured $DcrImmutableId) -and (Test-Configured $StreamName)) {
+    Write-CMTraceLog "-------------------------------------------------------------------"
+    Write-CMTraceLog "Ingestion dry-run: POST to the real DCR stream (the collector's actual upload path)"
+    $ingestUri = "$($DceURI.TrimEnd('/'))/dataCollectionRules/$DcrImmutableId/streams/$StreamName" + "?api-version=2023-01-01"
+    Write-CMTraceLog "  URL: $ingestUri"
+    # An empty JSON array routes through the exact DCR + stream + permission checks the collector hits,
+    # but writes no data. 404 = the DCR immutable id / stream name / DCE association is wrong (the
+    # collector's error); 403 = missing 'Monitoring Metrics Publisher' role; 400/204 = the target
+    # resolved correctly (empty body), so the ingestion configuration is good.
+    try {
+        $resp = Invoke-WebRequest -Uri $ingestUri -Method POST -Headers @{ Authorization = "Bearer $script:AccessToken" } `
+            -ContentType "application/json" -Body "[]" -TimeoutSec $TimeoutSeconds -UseBasicParsing -ErrorAction Stop
+        Write-CMTraceLog "  [PASS] Ingestion accepted (HTTP $([int]$resp.StatusCode)). The DCR, stream, and permissions are correct." -Type 1
+    } catch [System.Net.WebException] {
+        $r = $_.Exception.Response
+        $code = if ($r -and ($r -is [System.Net.HttpWebResponse])) { [int]$r.StatusCode } else { $null }
+        $bodyText = ""
+        if ($r) { try { $rs = New-Object System.IO.StreamReader($r.GetResponseStream()); $bodyText = $rs.ReadToEnd(); $rs.Close() } catch {} }
+        switch ($code) {
+            400 { Write-CMTraceLog "  [PASS] The DCR and stream resolved (HTTP 400 for the empty probe body is expected). The ingestion path is configured correctly." -Type 1 }
+            401 { Write-CMTraceLog "  [FAIL] HTTP 401. The access token was rejected (wrong tenant/authority or audience). The upload scope must be https://monitor.azure.com//.default." -Type 3
+                  $script:PreflightFailures.Add("Ingestion: 401 (token rejected).") }
+            403 { Write-CMTraceLog "  [FAIL] HTTP 403. Sign-in works but the app cannot write to this DCR. Grant the app the 'Monitoring Metrics Publisher' role on the DCR (or DCE), then wait a few minutes." -Type 3
+                  $script:PreflightFailures.Add("Ingestion: 403 (app lacks Monitoring Metrics Publisher on the DCR).") }
+            404 { Write-CMTraceLog "  [FAIL] HTTP 404. This is the collector's upload error. The DCR immutable id or stream does not resolve on this DCE. Verify: (1) `$DcrImmutableId is the DCR's IMMUTABLE ID (not its name or resource id); (2) the DCR declares a stream named '$StreamName'; (3) the DCR is associated with the DCE at `$DceURI (they must be from the same deployment)." -Type 3
+                  $script:PreflightFailures.Add("Ingestion: 404 (DCR immutable id / stream / DCE association is wrong).") }
+            407 { Write-CMTraceLog "  [FAIL] HTTP 407. The SYSTEM account cannot authenticate to the proxy." -Type 3
+                  $script:PreflightFailures.Add("Ingestion: 407 (proxy authentication).") }
+            default { Write-CMTraceLog "  [FAIL] HTTP $code on the ingestion POST. $($_.Exception.Message)" -Type 3
+                  $script:PreflightFailures.Add("Ingestion: HTTP $code.") }
+        }
+        if ($bodyText) { Write-CMTraceLog "         Azure response: $bodyText" -Type 2 }
+    } catch {
+        Write-CMTraceLog "  [FAIL] Ingestion dry-run failed: $($_.Exception.Message)" -Type 3
+        $script:PreflightFailures.Add("Ingestion: $($_.Exception.Message)")
+    }
+} elseif ($TestIngestion -and $LogAPIMode -eq "LogIngestionAPI" -and (Test-Configured $DceURI) -and -not (Test-Configured $DcrImmutableId)) {
+    Write-CMTraceLog "-------------------------------------------------------------------"
+    Write-CMTraceLog "Ingestion dry-run SKIPPED: set `$DcrImmutableId (and `$StreamName) to test the real upload path. Without it this test CANNOT catch an upload 404." -Type 2
 }
 #endregion run -----------------------------------------------------------------
 
@@ -344,13 +399,19 @@ $failedRequired = @($results | Where-Object { $_.Required -and -not $_.Pass })
 $failedOptional = @($results | Where-Object { -not $_.Required -and -not $_.Pass })
 $passed         = @($results | Where-Object { $_.Pass })
 
+$preflight = @($script:PreflightFailures)
+
 Write-CMTraceLog "==================================================================="
-Write-CMTraceLog ("SUMMARY: {0} passed, {1} required failure(s), {2} optional failure(s)." -f `
-    $passed.Count, $failedRequired.Count, $failedOptional.Count) -Type $(if ($failedRequired.Count) { 3 } else { 1 })
+Write-CMTraceLog ("SUMMARY: {0} passed, {1} required failure(s), {2} sign-in/ingestion failure(s), {3} optional failure(s)." -f `
+    $passed.Count, $failedRequired.Count, $preflight.Count, $failedOptional.Count) -Type $(if ($failedRequired.Count -or $preflight.Count) { 3 } else { 1 })
 
 if ($failedRequired.Count) {
     Write-CMTraceLog "Required endpoints that FAILED (these will break inventory upload):" -Type 3
     foreach ($f in $failedRequired) { Write-CMTraceLog ("  - {0} ({1}): {2}" -f $f.Name, $f.Host, $f.Detail) -Type 3 }
+}
+if ($preflight.Count) {
+    Write-CMTraceLog "Sign-in / ingestion checks that FAILED (these break inventory upload even when every endpoint is reachable):" -Type 3
+    foreach ($p in $preflight) { Write-CMTraceLog ("  - {0}" -f $p) -Type 3 }
 }
 if ($failedOptional.Count) {
     Write-CMTraceLog "Optional endpoints that failed (inventory still uploads; that data will be missing):" -Type 2
@@ -360,14 +421,17 @@ Write-CMTraceLog "Full log: $CMLog"
 Write-CMTraceLog "==================================================================="
 
 # Concise machine-readable line for Intune's detection-output column.
-if ($failedRequired.Count -eq 0 -and $failedOptional.Count -eq 0) {
-    Write-Output "PowerStacksInventoryConnectivity=OK (all $($passed.Count) endpoints reachable)"
+if ($failedRequired.Count -eq 0 -and $preflight.Count -eq 0 -and $failedOptional.Count -eq 0) {
+    Write-Output "PowerStacksInventoryConnectivity=OK (all checks passed)"
     exit 0
-} elseif ($failedRequired.Count -eq 0) {
+} elseif ($failedRequired.Count -eq 0 -and $preflight.Count -eq 0) {
     Write-Output ("PowerStacksInventoryConnectivity=WARN (optional failing: {0})" -f (($failedOptional | ForEach-Object { $_.Host }) -join ','))
     exit 0
 } else {
-    Write-Output ("PowerStacksInventoryConnectivity=FAIL (required failing: {0})" -f (($failedRequired | ForEach-Object { $_.Host }) -join ','))
+    $reasons = @()
+    if ($failedRequired.Count) { $reasons += (($failedRequired | ForEach-Object { $_.Host }) -join ',') }
+    if ($preflight.Count)      { $reasons += 'ingestion/sign-in' }
+    Write-Output ("PowerStacksInventoryConnectivity=FAIL ({0})" -f ($reasons -join '; '))
     exit 1
 }
 #endregion summary -------------------------------------------------------------
